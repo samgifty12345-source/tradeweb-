@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Icon's Trading Terminal</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<div id="login-screen">
+  <h1>Login to Trading Account</h1>
+  <input id="login" placeholder="Login (account number)" />
+  <input id="password" type="password" placeholder="Password" />
+  <input id="server" placeholder="Server (e.g. FundingPips-Live)" />
+  <select id="platform">
+    <option value="mt5">MT5</option>
+    <option value="mt4">MT4</option>
+  </select>
+  <button onclick="connectAccount()">Connect</button>
+  <p id="login-status"></p>
+</div>
+
+<div id="dashboard" style="display:none;">
+  <h1>Account</h1>
+  <div id="account-info"></div>
+
+  <h2>Place Trade</h2>
+  <input id="symbol" placeholder="Symbol (e.g. XAUUSD)" value="XAUUSD" />
+  <input id="volume" placeholder="Volume (lots)" value="0.01" />
+  <input id="sl" placeholder="Stop Loss (price)" />
+  <input id="tp" placeholder="Take Profit (price)" />
+  <button onclick="trade('buy')">Buy</button>
+  <button onclick="trade('sell')">Sell</button>
+  <p id="trade-status"></p>
+
+  <h2>Open Positions</h2>
+  <div id="positions"></div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
