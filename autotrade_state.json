@@ -29,6 +29,14 @@
     {
       "role": "model",
       "text": "Based on the last 20 15-minute candles, XAUUSD is down 11.96 from its recent high of 4061.4085, which is approximately a -0.29% movement. So, it has been bearish over this period."
+    },
+    {
+      "role": "user",
+      "text": "i mean on a daily check"
+    },
+    {
+      "role": "model",
+      "text": "I'm currently only tracking XAUUSD on a 15-minute timeframe, so I don't have the daily percentage movement data readily available for you right now.\n\nIf you'd like me to track gold on a daily timeframe, I can update the auto-trader's setting. Would you like to change the timeframe to 1day?"
     }
   ]
 }
