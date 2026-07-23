@@ -2,6 +2,7 @@ import os
 import uuid
 from typing import Dict
 
+import httpx
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -132,6 +133,38 @@ async def close_position(account_id: str, position_id: str):
     conn = _get_connection(account_id)
     result = await conn.close_position(position_id)
     return result
+
+
+@app.get("/api/chart/{symbol}")
+async def get_chart(symbol: str, interval: str = "5m", range: str = "1d"):
+    """Free live candle data — no API key, no cost. Used for AI/chart viewing,
+    separate from the MetaApi account connection."""
+    yahoo_symbol = f"{symbol.upper()}=X"
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
+    params = {"interval": interval, "range": range}
+
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+
+    if r.status_code != 200:
+        raise HTTPException(502, "Failed to fetch chart data")
+
+    data = r.json()
+    try:
+        result = data["chart"]["result"][0]
+        timestamps = result["timestamp"]
+        quote = result["indicators"]["quote"][0]
+        candles = [
+            {"time": t, "open": o, "high": h, "low": l, "close": c}
+            for t, o, h, l, c in zip(
+                timestamps, quote["open"], quote["high"], quote["low"], quote["close"]
+            )
+            if o is not None
+        ]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, "Unexpected data format from chart source")
+
+    return {"symbol": symbol.upper(), "candles": candles}
 
 
 # serve the frontend
