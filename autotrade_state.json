@@ -1,0 +1,18 @@
+{
+  "settings": {
+    "symbol": "XAUUSD",
+    "interval": "15min",
+    "volume": 0.01,
+    "risk_notes": ""
+  },
+  "chat_history": [
+    {
+      "role": "user",
+      "text": "hi"
+    },
+    {
+      "role": "model",
+      "text": "Hello there! I'm your trading assistant. I can chat about market trends, trading strategy, and risk management. I also help you manage the settings for your live auto-trader. How can I help you today?"
+    }
+  ]
+}
