@@ -78,6 +78,16 @@
       <p class="subtitle">Runs automatically in the background every 15 min — this just shows what it decided</p>
       <div id="autotrade-log" class="autotrade-list"></div>
     </section>
+
+    <section class="card chat-card">
+      <h2>Talk to your AI</h2>
+      <p class="subtitle">Tell it to watch a different pair, switch timeframe, or set your risk rules — it updates the auto-trader live</p>
+      <div id="chat-messages" class="chat-messages"></div>
+      <div class="chat-input-row">
+        <input id="chat-input" placeholder="e.g. Watch EURUSD on H1, risk max 1% per trade" onkeydown="if(event.key==='Enter') sendChat()" />
+        <button class="primary-btn chat-send-btn" onclick="sendChat()">Send</button>
+      </div>
+    </section>
   </div>
 </div>
 
