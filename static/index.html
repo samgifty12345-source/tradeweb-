@@ -21,8 +21,14 @@
 </div>
 
 <div id="dashboard" style="display:none;">
+  <button id="logout-btn" onclick="logout()">&larr; Log out</button>
+
   <h1>Account</h1>
   <div id="account-info"></div>
+
+  <h2>Live Chart</h2>
+  <input id="chart-symbol" placeholder="Symbol (e.g. XAUUSD)" value="XAUUSD" onchange="loadChart()" />
+  <canvas id="chart-canvas" width="600" height="250"></canvas>
 
   <h2>Place Trade</h2>
   <input id="symbol" placeholder="Symbol (e.g. XAUUSD)" value="XAUUSD" />
