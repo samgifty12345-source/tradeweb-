@@ -135,34 +135,46 @@ async def close_position(account_id: str, position_id: str):
     return result
 
 
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
+
+
 @app.get("/api/chart/{symbol}")
-async def get_chart(symbol: str, interval: str = "5m", range: str = "1d"):
-    """Free live candle data — no API key, no cost. Used for AI/chart viewing,
-    separate from the MetaApi account connection."""
-    yahoo_symbol = f"{symbol.upper()}=X"
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
-    params = {"interval": interval, "range": range}
+async def get_chart(symbol: str, interval: str = "5min", outputsize: int = 100):
+    """Free live candle data via Twelve Data (works from servers, unlike Yahoo's
+    endpoint which frequently blocks non-browser traffic). Free API key required —
+    sign up at twelvedata.com, no card needed."""
+    if not TWELVEDATA_API_KEY:
+        raise HTTPException(500, "TWELVEDATA_API_KEY is not set on the server")
+
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVEDATA_API_KEY,
+    }
 
     async with httpx.AsyncClient() as client:
-        r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+        r = await client.get(url, params=params)
 
     if r.status_code != 200:
         raise HTTPException(502, "Failed to fetch chart data")
 
     data = r.json()
-    try:
-        result = data["chart"]["result"][0]
-        timestamps = result["timestamp"]
-        quote = result["indicators"]["quote"][0]
-        candles = [
-            {"time": t, "open": o, "high": h, "low": l, "close": c}
-            for t, o, h, l, c in zip(
-                timestamps, quote["open"], quote["high"], quote["low"], quote["close"]
-            )
-            if o is not None
-        ]
-    except (KeyError, IndexError, TypeError):
-        raise HTTPException(502, "Unexpected data format from chart source")
+    if data.get("status") == "error":
+        raise HTTPException(502, data.get("message", "Chart data source returned an error"))
+
+    values = data.get("values", [])
+    candles = [
+        {
+            "time": v["datetime"],
+            "open": float(v["open"]),
+            "high": float(v["high"]),
+            "low": float(v["low"]),
+            "close": float(v["close"]),
+        }
+        for v in reversed(values)
+    ]
 
     return {"symbol": symbol.upper(), "candles": candles}
 
