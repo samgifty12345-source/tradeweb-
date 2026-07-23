@@ -52,14 +52,20 @@ function showDashboard() {
 }
 
 async function loadChart() {
-  const symbol = document.getElementById("chart-symbol").value || "XAUUSD";
+  const raw = (document.getElementById("chart-symbol").value || "XAUUSD").toUpperCase().replace("/", "");
+  const symbol = raw.length === 6 ? `${raw.slice(0, 3)}/${raw.slice(3)}` : raw; // XAUUSD -> XAU/USD
+  const statusEl = document.getElementById("chart-status");
   try {
-    const res = await fetch(`${API_BASE}/api/chart/${symbol}?interval=5m&range=1d`);
-    if (!res.ok) return;
+    const res = await fetch(`${API_BASE}/api/chart/${encodeURIComponent(symbol)}?interval=5min&outputsize=100`);
     const data = await res.json();
+    if (!res.ok) {
+      statusEl.innerText = data.detail || "Chart failed to load";
+      return;
+    }
+    statusEl.innerText = "";
     drawChart(data.candles);
   } catch (err) {
-    // silent — chart is a nice-to-have, don't block the rest of the UI
+    statusEl.innerText = "Chart failed to load: " + err.message;
   }
 }
 
