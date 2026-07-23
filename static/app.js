@@ -51,10 +51,24 @@ function showDashboard() {
   refreshAccount();
   refreshPositions();
   refreshAutotradeLog();
+  loadChatHistory();
   startChart();
   setInterval(refreshAccount, 5000);
   setInterval(refreshPositions, 5000);
   setInterval(refreshAutotradeLog, 15000);
+}
+
+async function loadChatHistory() {
+  try {
+    const res = await fetch(`${API_BASE}/api/chat/history`);
+    if (!res.ok) return;
+    const history = await res.json();
+    const el = document.getElementById("chat-messages");
+    el.innerHTML = "";
+    history.forEach((h) => appendChatBubble(h.role === "user" ? "user" : "ai", h.text));
+  } catch (err) {
+    // silent
+  }
 }
 
 async function refreshAutotradeLog() {
@@ -164,8 +178,6 @@ async function closePosition(positionId) {
 
 // ---------- Chat with AI ----------
 
-let chatHistory = [];
-
 function appendChatBubble(role, text) {
   const el = document.getElementById("chat-messages");
   const bubble = document.createElement("div");
@@ -191,7 +203,7 @@ async function sendChat() {
     const res = await fetch(`${API_BASE}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, history: chatHistory }),
+      body: JSON.stringify({ message }),
     });
     const data = await res.json();
     thinking.remove();
@@ -200,8 +212,6 @@ async function sendChat() {
       return;
     }
     appendChatBubble("ai", data.reply);
-    chatHistory.push({ role: "user", text: message });
-    chatHistory.push({ role: "model", text: data.reply });
   } catch (err) {
     thinking.remove();
     appendChatBubble("ai", "Failed: " + err.message);
