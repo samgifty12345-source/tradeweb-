@@ -2,46 +2,69 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Icon's Trading Terminal</title>
 <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
 
-<div id="login-screen">
-  <h1>Login to Trading Account</h1>
-  <input id="login" placeholder="Login (account number)" />
-  <input id="password" type="password" placeholder="Password" />
-  <input id="server" placeholder="Server (e.g. FundingPips-Live)" />
-  <select id="platform">
-    <option value="mt5">MT5</option>
-    <option value="mt4">MT4</option>
-  </select>
-  <button onclick="connectAccount()">Connect</button>
-  <p id="login-status"></p>
+<div id="login-screen" class="centered-screen">
+  <div class="login-card">
+    <h1>Trading Terminal</h1>
+    <p class="subtitle">Log in with any MT4/MT5 account — demo, broker, or prop firm</p>
+    <input id="login" placeholder="Login (account number)" />
+    <input id="password" type="password" placeholder="Password" />
+    <input id="server" placeholder="Server (e.g. FundingPips-Live)" />
+    <select id="platform">
+      <option value="mt5">MT5</option>
+      <option value="mt4">MT4</option>
+    </select>
+    <button class="primary-btn" onclick="connectAccount()">Connect</button>
+    <p id="login-status" class="status-text"></p>
+  </div>
 </div>
 
 <div id="dashboard" style="display:none;">
-  <button id="logout-btn" onclick="logout()">&larr; Log out</button>
+  <header class="topbar">
+    <span class="brand">Trading Terminal</span>
+    <button id="logout-btn" onclick="logout()">&larr; Log out</button>
+  </header>
 
-  <h1>Account</h1>
-  <div id="account-info"></div>
+  <div class="grid">
+    <section class="card account-card">
+      <h2>Account</h2>
+      <div id="account-info" class="account-stats">—</div>
+    </section>
 
-  <h2>Live Chart</h2>
-  <input id="chart-symbol" placeholder="Symbol (e.g. XAUUSD)" value="XAUUSD" onchange="loadChart()" />
-  <canvas id="chart-canvas" width="600" height="250"></canvas>
-  <p id="chart-status" style="color:#f66;"></p>
+    <section class="card chart-card">
+      <div class="card-header-row">
+        <h2>Live Chart</h2>
+        <input id="chart-symbol" class="inline-input" placeholder="Symbol" value="XAUUSD" onchange="loadChart()" />
+      </div>
+      <canvas id="chart-canvas" width="800" height="320"></canvas>
+      <p id="chart-status" class="status-text error-text"></p>
+    </section>
 
-  <h2>Place Trade</h2>
-  <input id="symbol" placeholder="Symbol (e.g. XAUUSD)" value="XAUUSD" />
-  <input id="volume" placeholder="Volume (lots)" value="0.01" />
-  <input id="sl" placeholder="Stop Loss (price)" />
-  <input id="tp" placeholder="Take Profit (price)" />
-  <button onclick="trade('buy')">Buy</button>
-  <button onclick="trade('sell')">Sell</button>
-  <p id="trade-status"></p>
+    <section class="card trade-card">
+      <h2>Place Trade</h2>
+      <div class="trade-form">
+        <input id="symbol" placeholder="Symbol" value="XAUUSD" />
+        <input id="volume" placeholder="Volume (lots)" value="0.01" />
+        <input id="sl" placeholder="Stop Loss (price)" />
+        <input id="tp" placeholder="Take Profit (price)" />
+      </div>
+      <div class="trade-buttons">
+        <button class="buy-btn" onclick="trade('buy')">Buy</button>
+        <button class="sell-btn" onclick="trade('sell')">Sell</button>
+      </div>
+      <p id="trade-status" class="status-text"></p>
+    </section>
 
-  <h2>Open Positions</h2>
-  <div id="positions"></div>
+    <section class="card positions-card">
+      <h2>Open Positions</h2>
+      <div id="positions" class="positions-list"></div>
+    </section>
+  </div>
 </div>
 
 <script src="/static/app.js"></script>
