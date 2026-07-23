@@ -39,9 +39,17 @@
     <section class="card chart-card">
       <div class="card-header-row">
         <h2>Live Chart</h2>
-        <input id="chart-symbol" class="inline-input" placeholder="Symbol" value="XAUUSD" onchange="loadChart()" />
+        <input id="chart-symbol" class="inline-input" placeholder="Symbol" value="XAUUSD" onchange="changeSymbol()" />
       </div>
-      <canvas id="chart-canvas" width="800" height="320"></canvas>
+      <div class="timeframe-row">
+        <button class="tf-btn active" data-tf="1min" onclick="changeTimeframe('1min', this)">M1</button>
+        <button class="tf-btn" data-tf="5min" onclick="changeTimeframe('5min', this)">M5</button>
+        <button class="tf-btn" data-tf="15min" onclick="changeTimeframe('15min', this)">M15</button>
+        <button class="tf-btn" data-tf="1h" onclick="changeTimeframe('1h', this)">H1</button>
+        <button class="tf-btn" data-tf="4h" onclick="changeTimeframe('4h', this)">H4</button>
+        <button class="tf-btn" data-tf="1day" onclick="changeTimeframe('1day', this)">D1</button>
+      </div>
+      <div id="chart-container"></div>
       <p id="chart-status" class="status-text error-text"></p>
     </section>
 
@@ -67,6 +75,7 @@
   </div>
 </div>
 
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
