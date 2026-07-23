@@ -27,13 +27,69 @@ async function connectAccount() {
   }
 }
 
+function logout() {
+  // pure local action — clears session and resets the UI even if
+  // network calls elsewhere on the page are frozen/hanging
+  localStorage.removeItem("accountId");
+  accountId = null;
+  document.getElementById("dashboard").style.display = "none";
+  document.getElementById("login-screen").style.display = "block";
+  document.getElementById("login-status").innerText = "";
+}
+
+let chartInterval = null;
+
 function showDashboard() {
   document.getElementById("login-screen").style.display = "none";
   document.getElementById("dashboard").style.display = "block";
   refreshAccount();
   refreshPositions();
+  loadChart();
   setInterval(refreshAccount, 5000);
   setInterval(refreshPositions, 5000);
+  if (chartInterval) clearInterval(chartInterval);
+  chartInterval = setInterval(loadChart, 15000); // refresh chart every 15s
+}
+
+async function loadChart() {
+  const symbol = document.getElementById("chart-symbol").value || "XAUUSD";
+  try {
+    const res = await fetch(`${API_BASE}/api/chart/${symbol}?interval=5m&range=1d`);
+    if (!res.ok) return;
+    const data = await res.json();
+    drawChart(data.candles);
+  } catch (err) {
+    // silent — chart is a nice-to-have, don't block the rest of the UI
+  }
+}
+
+function drawChart(candles) {
+  const canvas = document.getElementById("chart-canvas");
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!candles || candles.length === 0) return;
+
+  const closes = candles.map((c) => c.close);
+  const min = Math.min(...closes);
+  const max = Math.max(...closes);
+  const range = max - min || 1;
+  const stepX = canvas.width / (candles.length - 1 || 1);
+
+  ctx.strokeStyle = "#2563eb";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  candles.forEach((c, i) => {
+    const x = i * stepX;
+    const y = canvas.height - ((c.close - min) / range) * canvas.height;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  ctx.fillStyle = "#888";
+  ctx.font = "12px sans-serif";
+  ctx.fillText(max.toFixed(4), 4, 12);
+  ctx.fillText(min.toFixed(4), 4, canvas.height - 4);
 }
 
 async function refreshAccount() {
