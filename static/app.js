@@ -162,7 +162,51 @@ async function closePosition(positionId) {
   refreshPositions();
 }
 
-// ---------- Live chart (interactive: scroll, zoom, pan, timeframes) ----------
+// ---------- Chat with AI ----------
+
+let chatHistory = [];
+
+function appendChatBubble(role, text) {
+  const el = document.getElementById("chat-messages");
+  const bubble = document.createElement("div");
+  bubble.className = `chat-bubble ${role === "user" ? "chat-user" : "chat-ai"}`;
+  bubble.innerText = text;
+  el.appendChild(bubble);
+  el.scrollTop = el.scrollHeight;
+}
+
+async function sendChat() {
+  const input = document.getElementById("chat-input");
+  const message = input.value.trim();
+  if (!message) return;
+  input.value = "";
+  appendChatBubble("user", message);
+
+  const thinking = document.createElement("div");
+  thinking.className = "chat-bubble chat-ai chat-thinking";
+  thinking.innerText = "...";
+  document.getElementById("chat-messages").appendChild(thinking);
+
+  try {
+    const res = await fetch(`${API_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, history: chatHistory }),
+    });
+    const data = await res.json();
+    thinking.remove();
+    if (!res.ok) {
+      appendChatBubble("ai", data.detail || "Something went wrong");
+      return;
+    }
+    appendChatBubble("ai", data.reply);
+    chatHistory.push({ role: "user", text: message });
+    chatHistory.push({ role: "model", text: data.reply });
+  } catch (err) {
+    thinking.remove();
+    appendChatBubble("ai", "Failed: " + err.message);
+  }
+}
 
 function currentSymbol() {
   const raw = (document.getElementById("chart-symbol").value || "XAUUSD").toUpperCase().replace("/", "");
