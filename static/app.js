@@ -50,9 +50,46 @@ function showDashboard() {
   document.getElementById("dashboard").style.display = "block";
   refreshAccount();
   refreshPositions();
+  refreshAutotradeLog();
   startChart();
   setInterval(refreshAccount, 5000);
   setInterval(refreshPositions, 5000);
+  setInterval(refreshAutotradeLog, 15000);
+}
+
+async function refreshAutotradeLog() {
+  try {
+    const res = await fetch(`${API_BASE}/api/autotrade/log`);
+    if (!res.ok) return;
+    const log = await res.json();
+    const el = document.getElementById("autotrade-log");
+    el.innerHTML = "";
+    if (log.length === 0) {
+      el.innerHTML = `<p class="empty-note">No AI checks yet — will appear here once the scheduler starts running</p>`;
+      return;
+    }
+    log.forEach((entry) => {
+      const row = document.createElement("div");
+      row.className = "autotrade-row";
+      const time = new Date(entry.time).toLocaleString();
+      const decision = entry.decision || {};
+      let statusClass = "at-hold";
+      let statusLabel = "HOLD";
+      if (entry.status === "trade_placed") { statusClass = "at-trade"; statusLabel = decision.action ? decision.action.toUpperCase() : "TRADE"; }
+      else if (entry.status === "error") { statusClass = "at-error"; statusLabel = "ERROR"; }
+      else if (entry.status === "skipped") { statusClass = "at-skip"; statusLabel = "SKIPPED"; }
+      row.innerHTML = `
+        <div class="at-top">
+          <span class="at-badge ${statusClass}">${statusLabel}</span>
+          <span class="at-time">${time}</span>
+        </div>
+        <div class="at-reason">${entry.reason || decision.reason || ""}</div>
+      `;
+      el.appendChild(row);
+    });
+  } catch (err) {
+    // silent — non-critical panel
+  }
 }
 
 async function refreshAccount() {
