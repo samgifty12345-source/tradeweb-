@@ -37,38 +37,44 @@ async def connect(payload: dict = Body(...)):
     if not all([login, password, server]):
         raise HTTPException(400, "login, password, server are required")
 
-    account_api = api.metatrader_account_api
+    try:
+        account_api = api.metatrader_account_api
 
-    # reuse an existing MetaApi account entry if we've already registered this login+server
-    existing_accounts = await account_api.get_accounts_with_infinite_scroll_pagination()
-    account = next(
-        (a for a in existing_accounts if a.login == login and a.server == server),
-        None,
-    )
-
-    if account is None:
-        account = await account_api.create_account(
-            {
-                "name": f"{login}-{server}-{uuid.uuid4().hex[:6]}",
-                "type": "cloud",
-                "login": login,
-                "password": password,
-                "server": server,
-                "platform": platform,
-                "magic": 1000,
-            }
+        # reuse an existing MetaApi account entry if we've already registered this login+server
+        existing_accounts = await account_api.get_accounts_with_infinite_scroll_pagination()
+        account = next(
+            (a for a in existing_accounts if a.login == login and a.server == server),
+            None,
         )
 
-    await account.deploy()
-    await account.wait_connected()
+        if account is None:
+            account = await account_api.create_account(
+                {
+                    "name": f"{login}-{server}-{uuid.uuid4().hex[:6]}",
+                    "type": "cloud",
+                    "login": login,
+                    "password": password,
+                    "server": server,
+                    "platform": platform,
+                    "magic": 1000,
+                }
+            )
 
-    connection = account.get_rpc_connection()
-    await connection.connect()
-    await connection.wait_synchronized()
+        await account.deploy()
+        await account.wait_connected()
 
-    connections[account.id] = connection
+        connection = account.get_rpc_connection()
+        await connection.connect()
+        await connection.wait_synchronized()
 
-    return {"accountId": account.id}
+        connections[account.id] = connection
+
+        return {"accountId": account.id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # surface the real MetaApi/SDK error instead of a generic 500
+        raise HTTPException(502, f"Connect failed: {str(e)}")
 
 
 def _get_connection(account_id: str):
@@ -138,7 +144,7 @@ async def close_position(account_id: str, position_id: str):
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 
 
-@app.get("/api/chart/{symbol}")
+@app.get("/api/chart")
 async def get_chart(symbol: str, interval: str = "5min", outputsize: int = 100):
     """Free live candle data via Twelve Data (works from servers, unlike Yahoo's
     endpoint which frequently blocks non-browser traffic). Free API key required —
