@@ -1,50 +1,171 @@
-body {
-  font-family: -apple-system, sans-serif;
-  background: #0d0d0d;
-  color: #f0f0f0;
-  max-width: 500px;
-  margin: 40px auto;
-  padding: 0 20px;
+:root {
+  --bg: #0a0d12;
+  --panel: #12161d;
+  --border: #232a35;
+  --text: #e8ecf1;
+  --muted: #7a8494;
+  --blue: #2f6dff;
+  --red: #ef4655;
+  --green-buy: #1fae6b;
 }
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: 'Segoe UI', -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  margin: 0;
+  min-height: 100vh;
+}
+
+h1, h2 { margin: 0 0 12px 0; font-weight: 600; }
+h2 { font-size: 15px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+
 input, select {
   display: block;
   width: 100%;
-  padding: 10px;
+  padding: 11px 12px;
   margin: 8px 0;
-  background: #1a1a1a;
-  border: 1px solid #333;
-  color: #fff;
-  border-radius: 6px;
+  background: #0e1218;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
 }
+input:focus, select:focus { outline: none; border-color: var(--blue); }
+input::placeholder { color: var(--muted); }
+
 button {
-  padding: 10px 16px;
-  margin: 6px 6px 6px 0;
-  background: #2563eb;
+  padding: 11px 18px;
   border: none;
   color: white;
-  border-radius: 6px;
+  border-radius: 8px;
   cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  font-family: inherit;
 }
-button:hover { background: #1d4ed8; }
-#logout-btn {
-  background: #333;
-  margin-bottom: 12px;
+
+/* Login screen */
+.centered-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
 }
-#logout-btn:hover { background: #444; }
+.login-card {
+  width: 100%;
+  max-width: 400px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 32px;
+}
+.login-card h1 { font-size: 22px; }
+.subtitle { color: var(--muted); font-size: 13px; margin: 0 0 20px 0; }
+.primary-btn {
+  width: 100%;
+  background: var(--blue);
+  margin-top: 8px;
+  padding: 13px;
+}
+.primary-btn:hover { background: #1e5ae8; }
+
+/* Dashboard */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+}
+.brand { font-weight: 600; font-size: 15px; }
+#logout-btn { background: var(--panel); border: 1px solid var(--border); color: var(--text); }
+#logout-btn:hover { background: #1a2029; }
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  padding: 20px 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+}
+.account-card, .chart-card { grid-column: 1 / -1; }
+
+.account-stats {
+  display: flex;
+  gap: 32px;
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+.account-stats .stat-label { color: var(--muted); font-size: 12px; display: block; margin-bottom: 2px; }
+
+.card-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.card-header-row h2 { margin: 0; }
+.inline-input { width: 140px; margin: 0; padding: 7px 10px; }
+
 #chart-canvas {
   width: 100%;
-  height: 250px;
-  background: #111;
-  border: 1px solid #333;
-  border-radius: 6px;
-  margin: 8px 0;
+  height: 320px;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 12px;
+  display: block;
 }
-.position {
-  border: 1px solid #333;
-  padding: 10px;
-  margin: 8px 0;
-  border-radius: 6px;
+
+.trade-form { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+.trade-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+.buy-btn { background: var(--green-buy); }
+.buy-btn:hover { background: #189259; }
+.sell-btn { background: var(--red); }
+.sell-btn:hover { background: #d63a48; }
+
+.positions-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.position-row {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  justify-content: space-between;
+  background: #0e1218;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 14px;
+}
+.position-row .pos-meta { color: var(--muted); }
+.position-row .pos-profit { font-weight: 700; font-variant-numeric: tabular-nums; }
+.pos-profit.profit { color: var(--blue); }
+.pos-profit.loss { color: var(--red); }
+.position-row button {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 6px 12px;
+  font-weight: 500;
+}
+.position-row button:hover { border-color: var(--red); color: var(--red); }
+.empty-note { color: var(--muted); font-size: 13px; }
+
+.status-text { font-size: 13px; margin: 8px 0 0 0; min-height: 16px; }
+.error-text { color: var(--red); }
+
+@media (max-width: 720px) {
+  .grid { grid-template-columns: 1fr; padding: 16px; }
+  .trade-form { grid-template-columns: 1fr; }
+  .account-stats { flex-wrap: wrap; gap: 16px; }
 }
