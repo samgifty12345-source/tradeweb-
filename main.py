@@ -205,9 +205,17 @@ MT_LOGIN = os.getenv("MT_LOGIN", "")
 MT_PASSWORD = os.getenv("MT_PASSWORD", "")
 MT_SERVER = os.getenv("MT_SERVER", "")
 MT_PLATFORM = os.getenv("MT_PLATFORM", "mt5")
-TRADE_SYMBOL = os.getenv("TRADE_SYMBOL", "XAUUSD")
-TRADE_VOLUME = float(os.getenv("TRADE_VOLUME", "0.01"))
+TRADE_VOLUME_DEFAULT = float(os.getenv("TRADE_VOLUME", "0.01"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
+
+# Mutable at runtime via the chat panel — starts from env var defaults.
+# NOTE: resets to these defaults on every redeploy/restart (in-memory only).
+settings = {
+    "symbol": os.getenv("TRADE_SYMBOL", "XAUUSD"),
+    "interval": "15min",
+    "volume": TRADE_VOLUME_DEFAULT,
+    "risk_notes": "",  # free-text risk preferences the AI should respect
+}
 
 GEMINI_MODEL = "gemini-2.5-flash"
 
@@ -218,6 +226,8 @@ oldest first, as JSON: [{{time, open, high, low, close}}, ...].
 Analyze the candles for: liquidity sweeps, break of structure (BOS), change of character (CHoCH),
 fair value gaps (FVG), and order blocks. Only recommend a trade when there is a clear, high-probability
 setup. Most of the time the correct answer is "hold" — do not force a trade.
+
+Trader's risk management preferences (respect these strictly): {risk_notes}
 
 Respond with ONLY raw JSON (no markdown, no code fences, no extra text), in exactly this shape:
 {{"action": "buy" | "sell" | "hold", "stop_loss": number | null, "take_profit": number | null, "reason": "one short sentence"}}
@@ -237,6 +247,7 @@ async def _ask_gemini(symbol: str, interval: str, candles: list) -> dict:
         n=len(candles),
         symbol=symbol,
         interval=interval,
+        risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
         candles_json=json.dumps(candles),
     )
 
@@ -298,8 +309,12 @@ async def autotrade(secret: str = Query(...)):
             del autotrade_log[:-50]
             return entry
 
-        candles = await _fetch_candles(TRADE_SYMBOL, interval="15min", outputsize=50)
-        decision = await _ask_gemini(TRADE_SYMBOL, "15min", candles)
+        symbol = settings["symbol"]
+        interval = settings["interval"]
+        volume = settings["volume"]
+
+        candles = await _fetch_candles(symbol, interval=interval, outputsize=50)
+        decision = await _ask_gemini(symbol, interval, candles)
 
         action = decision.get("action", "hold")
         if action not in ("buy", "sell"):
@@ -309,7 +324,7 @@ async def autotrade(secret: str = Query(...)):
             return entry
 
         result = await _place_trade(
-            conn, TRADE_SYMBOL, action, TRADE_VOLUME,
+            conn, symbol, action, volume,
             sl=decision.get("stop_loss"), tp=decision.get("take_profit"),
         )
         entry.update({"status": "trade_placed", "decision": decision, "result": str(result)})
@@ -332,6 +347,92 @@ async def autotrade(secret: str = Query(...)):
 @app.get("/api/autotrade/log")
 async def get_autotrade_log():
     return list(reversed(autotrade_log))
+
+
+@app.get("/api/settings")
+async def get_settings():
+    return settings
+
+
+CHAT_SYSTEM_PROMPT = """You are the trading assistant embedded in Icon's trading dashboard.
+You can chat normally about markets, strategy, and risk management.
+
+You also control the live auto-trader's settings. Current settings:
+symbol={symbol}, timeframe={interval}, lot size={volume}, risk notes="{risk_notes}"
+
+If the user asks to change the pair, timeframe, lot size, or states a risk management
+preference, update it. Timeframe must be one of: 1min, 5min, 15min, 1h, 4h, 1day.
+Symbol should be a 6-letter forex/metal pair like XAUUSD, EURUSD, GBPUSD (no slash).
+
+Respond with ONLY raw JSON (no markdown, no code fences), in exactly this shape:
+{{"reply": "your conversational reply to show the user", "settings_update": {{"symbol": string|null, "interval": string|null, "volume": number|null, "risk_notes": string|null}} }}
+
+Only include non-null fields for things the user actually asked to change — leave the rest null.
+If nothing should change, settings_update should have all fields null.
+"""
+
+
+@app.post("/api/chat")
+async def chat(payload: dict = Body(...)):
+    if not GEMINI_API_KEY:
+        raise HTTPException(500, "GEMINI_API_KEY is not set on the server")
+
+    message = payload.get("message", "")
+    history = payload.get("history", [])  # list of {role: "user"|"model", text: str}
+
+    if not message:
+        raise HTTPException(400, "message is required")
+
+    system = CHAT_SYSTEM_PROMPT.format(
+        symbol=settings["symbol"],
+        interval=settings["interval"],
+        volume=settings["volume"],
+        risk_notes=settings["risk_notes"] or "none set",
+    )
+
+    contents = [{"role": h["role"], "parts": [{"text": h["text"]}]} for h in history]
+    contents.append({"role": "user", "parts": [{"text": message}]})
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    body = {"system_instruction": {"parts": [{"text": system}]}, "contents": contents}
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, headers=headers, json=body)
+
+    if r.status_code != 200:
+        raise HTTPException(502, f"Gemini call failed: {r.text[:300]}")
+
+    data = r.json()
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise HTTPException(502, f"Unexpected Gemini response: {json.dumps(data)[:300]}")
+
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    text = text.strip()
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # fall back to just showing the raw text as the reply
+        return {"reply": text, "settings": settings}
+
+    update = parsed.get("settings_update") or {}
+    if update.get("symbol"):
+        settings["symbol"] = update["symbol"].upper().replace("/", "")
+    if update.get("interval"):
+        settings["interval"] = update["interval"]
+    if update.get("volume"):
+        settings["volume"] = float(update["volume"])
+    if update.get("risk_notes"):
+        settings["risk_notes"] = update["risk_notes"]
+
+    return {"reply": parsed.get("reply", ""), "settings": settings}
 
 
 # serve the frontend
