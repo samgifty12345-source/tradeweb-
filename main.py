@@ -155,9 +155,14 @@ async def _fetch_candles(symbol: str, interval: str = "15min", outputsize: int =
     if not TWELVEDATA_API_KEY:
         raise HTTPException(500, "TWELVEDATA_API_KEY is not set on the server")
 
+    # Twelve Data wants "XAU/USD" style, not "XAUUSD" — normalize either input
+    clean = symbol.upper().replace(" ", "")
+    if "/" not in clean and len(clean) == 6:
+        clean = f"{clean[:3]}/{clean[3:]}"
+
     url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": symbol.upper(),
+        "symbol": clean,
         "interval": interval,
         "outputsize": outputsize,
         "apikey": TWELVEDATA_API_KEY,
