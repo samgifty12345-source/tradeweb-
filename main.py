@@ -1,9 +1,10 @@
 import os
 import uuid
+import json
 from typing import Dict
 
 import httpx
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -27,53 +28,58 @@ app.add_middleware(
 connections: Dict[str, object] = {}
 
 
+async def _connect_account(login: str, password: str, server: str, platform: str = "mt5"):
+    """Shared connect logic — used by both the manual login and the autotrade loop.
+    MetaApi keeps the account deployed/running in ITS OWN cloud once deployed, so this
+    reconnects to that same always-on instance rather than spinning up anything new."""
+    account_api = api.metatrader_account_api
+
+    existing_accounts = await account_api.get_accounts_with_infinite_scroll_pagination()
+    account = next(
+        (a for a in existing_accounts if a.login == login and a.server == server),
+        None,
+    )
+
+    if account is None:
+        account = await account_api.create_account(
+            {
+                "name": f"{login}-{server}-{uuid.uuid4().hex[:6]}",
+                "type": "cloud",
+                "login": login,
+                "password": password,
+                "server": server,
+                "platform": platform,
+                "magic": 1000,
+            }
+        )
+
+    await account.deploy()
+    await account.wait_connected()
+
+    connection = account.get_rpc_connection()
+    await connection.connect()
+    await connection.wait_synchronized()
+
+    connections[account.id] = connection
+    return account.id, connection
+
+
 @app.post("/api/connect")
 async def connect(payload: dict = Body(...)):
     login = payload.get("login")
     password = payload.get("password")
     server = payload.get("server")
-    platform = payload.get("platform", "mt5")  # "mt4" or "mt5"
+    platform = payload.get("platform", "mt5")
 
     if not all([login, password, server]):
         raise HTTPException(400, "login, password, server are required")
 
     try:
-        account_api = api.metatrader_account_api
-
-        # reuse an existing MetaApi account entry if we've already registered this login+server
-        existing_accounts = await account_api.get_accounts_with_infinite_scroll_pagination()
-        account = next(
-            (a for a in existing_accounts if a.login == login and a.server == server),
-            None,
-        )
-
-        if account is None:
-            account = await account_api.create_account(
-                {
-                    "name": f"{login}-{server}-{uuid.uuid4().hex[:6]}",
-                    "type": "cloud",
-                    "login": login,
-                    "password": password,
-                    "server": server,
-                    "platform": platform,
-                    "magic": 1000,
-                }
-            )
-
-        await account.deploy()
-        await account.wait_connected()
-
-        connection = account.get_rpc_connection()
-        await connection.connect()
-        await connection.wait_synchronized()
-
-        connections[account.id] = connection
-
-        return {"accountId": account.id}
+        account_id, _ = await _connect_account(login, password, server, platform)
+        return {"accountId": account_id}
     except HTTPException:
         raise
     except Exception as e:
-        # surface the real MetaApi/SDK error instead of a generic 500
         raise HTTPException(502, f"Connect failed: {str(e)}")
 
 
@@ -105,19 +111,7 @@ async def get_price(account_id: str, symbol: str):
     return price
 
 
-@app.post("/api/trade/{account_id}")
-async def place_trade(account_id: str, payload: dict = Body(...)):
-    conn = _get_connection(account_id)
-
-    symbol = payload.get("symbol")
-    side = payload.get("side")  # "buy" or "sell"
-    volume = payload.get("volume")
-    sl = payload.get("sl")
-    tp = payload.get("tp")
-
-    if not all([symbol, side, volume]):
-        raise HTTPException(400, "symbol, side, volume are required")
-
+async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=None):
     opts = {}
     if sl:
         opts["stopLoss"] = float(sl)
@@ -125,13 +119,26 @@ async def place_trade(account_id: str, payload: dict = Body(...)):
         opts["takeProfit"] = float(tp)
 
     if side == "buy":
-        result = await conn.create_market_buy_order(symbol, float(volume), **opts)
+        return await conn.create_market_buy_order(symbol, float(volume), **opts)
     elif side == "sell":
-        result = await conn.create_market_sell_order(symbol, float(volume), **opts)
+        return await conn.create_market_sell_order(symbol, float(volume), **opts)
     else:
         raise HTTPException(400, "side must be 'buy' or 'sell'")
 
-    return result
+
+@app.post("/api/trade/{account_id}")
+async def place_trade(account_id: str, payload: dict = Body(...)):
+    conn = _get_connection(account_id)
+    symbol = payload.get("symbol")
+    side = payload.get("side")
+    volume = payload.get("volume")
+    sl = payload.get("sl")
+    tp = payload.get("tp")
+
+    if not all([symbol, side, volume]):
+        raise HTTPException(400, "symbol, side, volume are required")
+
+    return await _place_trade(conn, symbol, side, volume, sl, tp)
 
 
 @app.post("/api/close/{account_id}/{position_id}")
@@ -144,11 +151,7 @@ async def close_position(account_id: str, position_id: str):
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 
 
-@app.get("/api/chart")
-async def get_chart(symbol: str, interval: str = "5min", outputsize: int = 100):
-    """Free live candle data via Twelve Data (works from servers, unlike Yahoo's
-    endpoint which frequently blocks non-browser traffic). Free API key required —
-    sign up at twelvedata.com, no card needed."""
+async def _fetch_candles(symbol: str, interval: str = "15min", outputsize: int = 50):
     if not TWELVEDATA_API_KEY:
         raise HTTPException(500, "TWELVEDATA_API_KEY is not set on the server")
 
@@ -159,7 +162,6 @@ async def get_chart(symbol: str, interval: str = "5min", outputsize: int = 100):
         "outputsize": outputsize,
         "apikey": TWELVEDATA_API_KEY,
     }
-
     async with httpx.AsyncClient() as client:
         r = await client.get(url, params=params)
 
@@ -181,8 +183,124 @@ async def get_chart(symbol: str, interval: str = "5min", outputsize: int = 100):
         }
         for v in reversed(values)
     ]
+    return candles
 
+
+@app.get("/api/chart")
+async def get_chart(symbol: str, interval: str = "5min", outputsize: int = 100):
+    candles = await _fetch_candles(symbol, interval, outputsize)
     return {"symbol": symbol.upper(), "candles": candles}
+
+
+# ---------------- Autotrade (AI-driven, triggered by a free external cron) ----------------
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+AUTOTRADE_SECRET = os.getenv("AUTOTRADE_SECRET", "")
+MT_LOGIN = os.getenv("MT_LOGIN", "")
+MT_PASSWORD = os.getenv("MT_PASSWORD", "")
+MT_SERVER = os.getenv("MT_SERVER", "")
+MT_PLATFORM = os.getenv("MT_PLATFORM", "mt5")
+TRADE_SYMBOL = os.getenv("TRADE_SYMBOL", "XAUUSD")
+TRADE_VOLUME = float(os.getenv("TRADE_VOLUME", "0.01"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
+
+GEMINI_MODEL = "gemini-2.5-flash"
+
+STRATEGY_PROMPT = """You are a disciplined ICT / Smart Money Concepts forex and gold trader.
+You will be given the most recent {n} candles for {symbol} on the {interval} timeframe,
+oldest first, as JSON: [{{time, open, high, low, close}}, ...].
+
+Analyze the candles for: liquidity sweeps, break of structure (BOS), change of character (CHoCH),
+fair value gaps (FVG), and order blocks. Only recommend a trade when there is a clear, high-probability
+setup. Most of the time the correct answer is "hold" — do not force a trade.
+
+Respond with ONLY raw JSON (no markdown, no code fences, no extra text), in exactly this shape:
+{{"action": "buy" | "sell" | "hold", "stop_loss": number | null, "take_profit": number | null, "reason": "one short sentence"}}
+
+stop_loss and take_profit must be realistic absolute prices for {symbol}, consistent with recent price levels.
+If action is "hold", stop_loss and take_profit must be null.
+Candles:
+{candles_json}
+"""
+
+
+async def _ask_gemini(symbol: str, interval: str, candles: list) -> dict:
+    if not GEMINI_API_KEY:
+        raise HTTPException(500, "GEMINI_API_KEY is not set on the server")
+
+    prompt = STRATEGY_PROMPT.format(
+        n=len(candles),
+        symbol=symbol,
+        interval=interval,
+        candles_json=json.dumps(candles),
+    )
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, headers=headers, json=body)
+
+    if r.status_code != 200:
+        raise HTTPException(502, f"Gemini call failed: {r.text[:300]}")
+
+    data = r.json()
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise HTTPException(502, f"Unexpected Gemini response: {json.dumps(data)[:300]}")
+
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    text = text.strip()
+
+    try:
+        decision = json.loads(text)
+    except json.JSONDecodeError:
+        raise HTTPException(502, f"Gemini did not return valid JSON: {text[:300]}")
+
+    return decision
+
+
+@app.get("/api/autotrade")
+async def autotrade(secret: str = Query(...)):
+    """Hit this URL from a free external cron (e.g. cron-job.org) every 15 min.
+    Runs while you sleep — no separate server/VPS needed, since MetaApi already
+    keeps the MT5 account deployed and connected in its own cloud."""
+    if not AUTOTRADE_SECRET or secret != AUTOTRADE_SECRET:
+        raise HTTPException(403, "Invalid secret")
+
+    if not all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
+        raise HTTPException(500, "MT_LOGIN, MT_PASSWORD, MT_SERVER env vars must be set for autotrade")
+
+    try:
+        account_id, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
+
+        positions = await conn.get_positions()
+        if len(positions) >= MAX_OPEN_POSITIONS:
+            return {"status": "skipped", "reason": f"{len(positions)} open position(s), max is {MAX_OPEN_POSITIONS}"}
+
+        candles = await _fetch_candles(TRADE_SYMBOL, interval="15min", outputsize=50)
+        decision = await _ask_gemini(TRADE_SYMBOL, "15min", candles)
+
+        action = decision.get("action", "hold")
+        if action not in ("buy", "sell"):
+            return {"status": "hold", "decision": decision}
+
+        result = await _place_trade(
+            conn, TRADE_SYMBOL, action, TRADE_VOLUME,
+            sl=decision.get("stop_loss"), tp=decision.get("take_profit"),
+        )
+        return {"status": "trade_placed", "decision": decision, "result": str(result)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Autotrade failed: {str(e)}")
 
 
 # serve the frontend
