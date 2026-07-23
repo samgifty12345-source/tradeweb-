@@ -114,9 +114,9 @@ async def get_price(account_id: str, symbol: str):
 async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=None):
     opts = {}
     if sl:
-        opts["stopLoss"] = float(sl)
+        opts["stop_loss"] = float(sl)
     if tp:
-        opts["takeProfit"] = float(tp)
+        opts["take_profit"] = float(tp)
 
     if side == "buy":
         return await conn.create_market_buy_order(symbol, float(volume), **opts)
@@ -349,6 +349,59 @@ async def get_autotrade_log():
     return list(reversed(autotrade_log))
 
 
+import base64
+
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "")  # e.g. "yourname/tradeweb"
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+STATE_FILE_PATH = "autotrade_state.json"
+
+
+async def _github_get_state():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return None, None
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STATE_FILE_PATH}"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=headers, params={"ref": GITHUB_BRANCH})
+    if r.status_code == 200:
+        data = r.json()
+        content = base64.b64decode(data["content"]).decode()
+        return json.loads(content), data["sha"]
+    return None, None
+
+
+async def _github_save_state():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return
+    _, sha = await _github_get_state()
+    payload = {"settings": settings, "chat_history": chat_history[-40:]}
+    content_b64 = base64.b64encode(json.dumps(payload, indent=2).encode()).decode()
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STATE_FILE_PATH}"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+    body = {"message": "Update autotrade state", "content": content_b64, "branch": GITHUB_BRANCH}
+    if sha:
+        body["sha"] = sha
+    async with httpx.AsyncClient() as client:
+        await client.put(url, headers=headers, json=body)
+
+
+chat_history = []  # list of {role, text} — persisted to GitHub
+
+
+@app.on_event("startup")
+async def _load_state_on_startup():
+    state, _ = await _github_get_state()
+    if state:
+        settings.update(state.get("settings", {}))
+        chat_history.extend(state.get("chat_history", []))
+
+
+@app.get("/api/chat/history")
+async def get_chat_history():
+    return chat_history
+
+
 @app.get("/api/settings")
 async def get_settings():
     return settings
@@ -359,6 +412,12 @@ You can chat normally about markets, strategy, and risk management.
 
 You also control the live auto-trader's settings. Current settings:
 symbol={symbol}, timeframe={interval}, lot size={volume}, risk notes="{risk_notes}"
+
+LIVE DATA (use this — do not guess or use outdated training knowledge):
+{live_data}
+
+You do not execute trades yourself — the auto-trader does, on its own schedule, using
+these settings. Be honest about that; don't claim to place trades.
 
 If the user asks to change the pair, timeframe, lot size, or states a risk management
 preference, update it. Timeframe must be one of: 1min, 5min, 15min, 1h, 4h, 1day.
@@ -372,25 +431,64 @@ If nothing should change, settings_update should have all fields null.
 """
 
 
+async def _live_data_snapshot():
+    parts = []
+    try:
+        candles = await _fetch_candles(settings["symbol"], interval=settings["interval"], outputsize=20)
+        if candles:
+            last = candles[-1]
+            first = candles[0]
+            change = last["close"] - first["close"]
+            direction = "up" if change > 0 else "down" if change < 0 else "flat"
+            parts.append(
+                f"{settings['symbol']} last price: {last['close']}, "
+                f"{direction} {abs(change):.2f} over last {len(candles)} {settings['interval']} candles "
+                f"(recent high {max(c['high'] for c in candles)}, low {min(c['low'] for c in candles)})"
+            )
+    except Exception:
+        parts.append(f"(couldn't fetch live price for {settings['symbol']} right now)")
+
+    if all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
+        try:
+            _, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
+            info = await conn.get_account_information()
+            positions = await conn.get_positions()
+            parts.append(f"Account balance: {info.get('balance')} {info.get('currency')}, equity: {info.get('equity')}")
+            if positions:
+                pos_desc = ", ".join(f"{p['symbol']} {p['type']} {p['volume']} lots (P/L {p['profit']})" for p in positions)
+                parts.append(f"Open positions: {pos_desc}")
+            else:
+                parts.append("Open positions: none")
+        except Exception:
+            parts.append("(couldn't fetch account balance right now)")
+
+    if autotrade_log:
+        last_entry = autotrade_log[-1]
+        parts.append(f"Last auto-trade check: {last_entry.get('status')} — {last_entry.get('reason') or (last_entry.get('decision') or {}).get('reason', '')}")
+
+    return "\n".join(parts)
+
+
 @app.post("/api/chat")
 async def chat(payload: dict = Body(...)):
     if not GEMINI_API_KEY:
         raise HTTPException(500, "GEMINI_API_KEY is not set on the server")
 
     message = payload.get("message", "")
-    history = payload.get("history", [])  # list of {role: "user"|"model", text: str}
-
     if not message:
         raise HTTPException(400, "message is required")
+
+    live_data = await _live_data_snapshot()
 
     system = CHAT_SYSTEM_PROMPT.format(
         symbol=settings["symbol"],
         interval=settings["interval"],
         volume=settings["volume"],
         risk_notes=settings["risk_notes"] or "none set",
+        live_data=live_data,
     )
 
-    contents = [{"role": h["role"], "parts": [{"text": h["text"]}]} for h in history]
+    contents = [{"role": h["role"], "parts": [{"text": h["text"]}]} for h in chat_history[-20:]]
     contents.append({"role": "user", "parts": [{"text": message}]})
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
@@ -419,7 +517,9 @@ async def chat(payload: dict = Body(...)):
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        # fall back to just showing the raw text as the reply
+        chat_history.append({"role": "user", "text": message})
+        chat_history.append({"role": "model", "text": text})
+        await _github_save_state()
         return {"reply": text, "settings": settings}
 
     update = parsed.get("settings_update") or {}
@@ -432,7 +532,12 @@ async def chat(payload: dict = Body(...)):
     if update.get("risk_notes"):
         settings["risk_notes"] = update["risk_notes"]
 
-    return {"reply": parsed.get("reply", ""), "settings": settings}
+    reply = parsed.get("reply", "")
+    chat_history.append({"role": "user", "text": message})
+    chat_history.append({"role": "model", "text": reply})
+    await _github_save_state()
+
+    return {"reply": reply, "settings": settings}
 
 
 # serve the frontend
