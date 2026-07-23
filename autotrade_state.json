@@ -13,6 +13,14 @@
     {
       "role": "model",
       "text": "Hello there! I'm your trading assistant. I can chat about market trends, trading strategy, and risk management. I also help you manage the settings for your live auto-trader. How can I help you today?"
+    },
+    {
+      "role": "user",
+      "text": "how is gold looking today"
+    },
+    {
+      "role": "model",
+      "text": "XAUUSD (Gold) is currently trading at 4047.1212. It's down 11.58 over the last 20 15-minute candles. The recent high was 4061.4085, and the low was 4040.2681."
     }
   ]
 }
