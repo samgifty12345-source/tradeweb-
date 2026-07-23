@@ -163,15 +163,30 @@ function toChartTime(datetimeStr) {
 }
 
 async function loadChartHistory() {
-  initChartIfNeeded();
   const statusEl = document.getElementById("chart-status");
+
+  if (typeof LightweightCharts === "undefined") {
+    statusEl.style.color = "#ef4655";
+    statusEl.innerText = "Chart library failed to load (network/ad-blocker may be blocking the CDN script). Try disabling ad blockers for this site, or a different network.";
+    return;
+  }
+
+  initChartIfNeeded();
+  statusEl.style.color = "#7a8494";
+  statusEl.innerText = "Loading chart...";
   try {
     const res = await fetch(
       `${API_BASE}/api/chart?symbol=${encodeURIComponent(currentSymbol())}&interval=${currentInterval}&outputsize=300`
     );
     const data = await res.json();
     if (!res.ok) {
+      statusEl.style.color = "#ef4655";
       statusEl.innerText = data.detail || "Chart failed to load";
+      return;
+    }
+    if (!data.candles || data.candles.length === 0) {
+      statusEl.style.color = "#ef4655";
+      statusEl.innerText = "No data returned for this symbol/timeframe";
       return;
     }
     statusEl.innerText = "";
@@ -185,6 +200,7 @@ async function loadChartHistory() {
     candleSeries.setData(formatted);
     chart.timeScale().fitContent();
   } catch (err) {
+    statusEl.style.color = "#ef4655";
     statusEl.innerText = "Chart failed to load: " + err.message;
   }
 }
@@ -227,5 +243,5 @@ function changeSymbol() {
 function startChart() {
   loadChartHistory();
   if (chartPollInterval) clearInterval(chartPollInterval);
-  chartPollInterval = setInterval(pollLatestCandle, 5000); // near-live: refresh every 5s
+  chartPollInterval = setInterval(pollLatestCandle, 20000); // stay under free-tier rate limits
 }
