@@ -1,5 +1,10 @@
 const API_BASE = ""; // same origin on Render
 
+let chart = null;
+let candleSeries = null;
+let currentInterval = "1min";
+let chartPollInterval = null;
+
 let accountId = localStorage.getItem("accountId");
 if (accountId) showDashboard();
 
@@ -39,8 +44,6 @@ function logout(reason) {
   document.getElementById("login-screen").style.display = "flex";
   document.getElementById("login-status").innerText = reason || "";
 }
-
-let chartInterval = null;
 
 function showDashboard() {
   document.getElementById("login-screen").style.display = "none";
@@ -123,11 +126,6 @@ async function closePosition(positionId) {
 }
 
 // ---------- Live chart (interactive: scroll, zoom, pan, timeframes) ----------
-
-let chart = null;
-let candleSeries = null;
-let currentInterval = "1min";
-let chartPollInterval = null;
 
 function currentSymbol() {
   const raw = (document.getElementById("chart-symbol").value || "XAUUSD").toUpperCase().replace("/", "");
