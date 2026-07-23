@@ -271,6 +271,11 @@ async def _ask_gemini(symbol: str, interval: str, candles: list) -> dict:
     return decision
 
 
+from datetime import datetime, timezone
+
+autotrade_log = []  # in-memory log of recent AI decisions, newest last
+
+
 @app.get("/api/autotrade")
 async def autotrade(secret: str = Query(...)):
     """Hit this URL from a free external cron (e.g. cron-job.org) every 15 min.
@@ -282,30 +287,51 @@ async def autotrade(secret: str = Query(...)):
     if not all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
         raise HTTPException(500, "MT_LOGIN, MT_PASSWORD, MT_SERVER env vars must be set for autotrade")
 
+    entry = {"time": datetime.now(timezone.utc).isoformat()}
     try:
         account_id, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
 
         positions = await conn.get_positions()
         if len(positions) >= MAX_OPEN_POSITIONS:
-            return {"status": "skipped", "reason": f"{len(positions)} open position(s), max is {MAX_OPEN_POSITIONS}"}
+            entry.update({"status": "skipped", "reason": f"{len(positions)} open position(s), max is {MAX_OPEN_POSITIONS}"})
+            autotrade_log.append(entry)
+            del autotrade_log[:-50]
+            return entry
 
         candles = await _fetch_candles(TRADE_SYMBOL, interval="15min", outputsize=50)
         decision = await _ask_gemini(TRADE_SYMBOL, "15min", candles)
 
         action = decision.get("action", "hold")
         if action not in ("buy", "sell"):
-            return {"status": "hold", "decision": decision}
+            entry.update({"status": "hold", "decision": decision})
+            autotrade_log.append(entry)
+            del autotrade_log[:-50]
+            return entry
 
         result = await _place_trade(
             conn, TRADE_SYMBOL, action, TRADE_VOLUME,
             sl=decision.get("stop_loss"), tp=decision.get("take_profit"),
         )
-        return {"status": "trade_placed", "decision": decision, "result": str(result)}
+        entry.update({"status": "trade_placed", "decision": decision, "result": str(result)})
+        autotrade_log.append(entry)
+        del autotrade_log[:-50]
+        return entry
 
-    except HTTPException:
+    except HTTPException as e:
+        entry.update({"status": "error", "reason": str(e.detail)})
+        autotrade_log.append(entry)
+        del autotrade_log[:-50]
         raise
     except Exception as e:
+        entry.update({"status": "error", "reason": str(e)})
+        autotrade_log.append(entry)
+        del autotrade_log[:-50]
         raise HTTPException(502, f"Autotrade failed: {str(e)}")
+
+
+@app.get("/api/autotrade/log")
+async def get_autotrade_log():
+    return list(reversed(autotrade_log))
 
 
 # serve the frontend
