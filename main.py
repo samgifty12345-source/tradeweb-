@@ -36,7 +36,7 @@ async def _connect_account(login: str, password: str, server: str, platform: str
 
     existing_accounts = await account_api.get_accounts_with_infinite_scroll_pagination()
     account = next(
-        (a for a in existing_accounts if a.login == login and a.server == server),
+        (a for a in existing_accounts if a.login == login),
         None,
     )
 
@@ -410,24 +410,27 @@ async def get_settings():
 CHAT_SYSTEM_PROMPT = """You are the trading assistant embedded in Icon's trading dashboard.
 You can chat normally about markets, strategy, and risk management.
 
-You also control the live auto-trader's settings. Current settings:
-symbol={symbol}, timeframe={interval}, lot size={volume}, risk notes="{risk_notes}"
+You also control the live auto-trader's settings, AND you can place a trade immediately
+if the user explicitly asks you to (e.g. "buy gold now", "place a sell on EURUSD 0.01 lots").
+Only trigger a trade on a clear, explicit instruction — never on your own initiative during
+normal conversation, and never just because you think it's a good setup.
+
+Current settings: symbol={symbol}, timeframe={interval}, lot size={volume}, risk notes="{risk_notes}"
 
 LIVE DATA (use this — do not guess or use outdated training knowledge):
 {live_data}
 
-You do not execute trades yourself — the auto-trader does, on its own schedule, using
-these settings. Be honest about that; don't claim to place trades.
-
 If the user asks to change the pair, timeframe, lot size, or states a risk management
-preference, update it. Timeframe must be one of: 1min, 5min, 15min, 1h, 4h, 1day.
+preference, update it via settings_update. Timeframe must be one of: 1min, 5min, 15min, 1h, 4h, 1day.
 Symbol should be a 6-letter forex/metal pair like XAUUSD, EURUSD, GBPUSD (no slash).
 
 Respond with ONLY raw JSON (no markdown, no code fences), in exactly this shape:
-{{"reply": "your conversational reply to show the user", "settings_update": {{"symbol": string|null, "interval": string|null, "volume": number|null, "risk_notes": string|null}} }}
+{{"reply": "your conversational reply to show the user",
+  "settings_update": {{"symbol": string|null, "interval": string|null, "volume": number|null, "risk_notes": string|null}},
+  "trade_action": {{"side": "buy"|"sell", "symbol": string, "volume": number, "stop_loss": number|null, "take_profit": number|null}} | null}}
 
-Only include non-null fields for things the user actually asked to change — leave the rest null.
-If nothing should change, settings_update should have all fields null.
+trade_action must be null unless the user just explicitly asked you to place a trade right now.
+If they didn't mention a symbol/volume for the trade, use the current settings' symbol/volume.
 """
 
 
@@ -533,6 +536,31 @@ async def chat(payload: dict = Body(...)):
         settings["risk_notes"] = update["risk_notes"]
 
     reply = parsed.get("reply", "")
+    trade_action = parsed.get("trade_action")
+
+    if trade_action and trade_action.get("side") in ("buy", "sell"):
+        if not all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
+            reply += "\n\n(Couldn't place it — no MT5 account configured on the server.)"
+        else:
+            try:
+                _, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
+                trade_symbol = trade_action.get("symbol") or settings["symbol"]
+                trade_volume = trade_action.get("volume") or settings["volume"]
+                result = await _place_trade(
+                    conn, trade_symbol, trade_action["side"], trade_volume,
+                    sl=trade_action.get("stop_loss"), tp=trade_action.get("take_profit"),
+                )
+                reply += f"\n\n✅ Placed {trade_action['side'].upper()} {trade_volume} lots on {trade_symbol}."
+                autotrade_log.append({
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "status": "trade_placed",
+                    "decision": {"action": trade_action["side"], "reason": "Manual command via chat"},
+                    "result": str(result),
+                })
+                del autotrade_log[:-50]
+            except Exception as e:
+                reply += f"\n\n❌ Trade failed: {str(e)}"
+
     chat_history.append({"role": "user", "text": message})
     chat_history.append({"role": "model", "text": reply})
     await _github_save_state()
