@@ -223,6 +223,7 @@ button {
 .at-skip { background: #1a2029; color: var(--muted); }
 .at-time { color: var(--muted); font-size: 12px; }
 .at-reason { color: var(--text); font-size: 13px; margin-top: 6px; }
+.at-meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
 
 .chat-messages {
   display: flex;
