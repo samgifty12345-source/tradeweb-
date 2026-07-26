@@ -354,8 +354,68 @@ async def _manage_sim_positions():
     return closed
 
 
+MARKET_HOURS_ENABLED = os.getenv("MARKET_HOURS_ENABLED", "false").lower() == "true"
+
+
+def _market_status():
+    """Forex market: open Sunday ~22:00 UTC through Friday ~22:00 UTC.
+    Approximate — doesn't account for broker-specific holidays or DST edge cases."""
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()  # Mon=0 ... Sun=6
+    hour = now.hour
+    if weekday == 5:  # Saturday — always closed
+        is_open = False
+    elif weekday == 6:  # Sunday — opens ~22:00 UTC
+        is_open = hour >= 22
+    elif weekday == 4:  # Friday — closes ~22:00 UTC
+        is_open = hour < 22
+    else:
+        is_open = True
+    return {"is_open": is_open, "checked_at": now.isoformat(), "enforced": MARKET_HOURS_ENABLED}
+
+
+_daily_run_count = {"date": None, "count": 0}
+
+
+def _bump_daily_run_count():
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _daily_run_count["date"] != today:
+        _daily_run_count["date"] = today
+        _daily_run_count["count"] = 0
+    _daily_run_count["count"] += 1
+    return _daily_run_count["count"]
+
+
+async def _fetch_forex_news():
+    """Free, unofficial Forex Factory calendar mirror — no API key needed.
+    Returns today's high-impact events, or a note if the fetch fails."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+        if r.status_code != 200:
+            return "(couldn't fetch news calendar right now)"
+        events = r.json()
+        today = datetime.now(timezone.utc).date().isoformat()
+        high_impact_today = [
+            f"{e.get('country')}: {e.get('title')} (forecast: {e.get('forecast', 'n/a')}, previous: {e.get('previous', 'n/a')})"
+            for e in events
+            if e.get("impact") == "High" and str(e.get("date", "")).startswith(today)
+        ]
+        if not high_impact_today:
+            return "No high-impact news events scheduled today."
+        return "High-impact news today: " + "; ".join(high_impact_today[:10])
+    except Exception as e:
+        return f"(news fetch failed: {str(e)})"
+
+
 async def _run_autotrade_sim():
     entry = {"time": datetime.now(timezone.utc).isoformat()}
+    entry["market"] = _market_status()  # logged only — not enforced yet, per Icon's instruction
+
+    run_number_today = _bump_daily_run_count()
+    if run_number_today <= 3:
+        entry["news_check"] = await _fetch_forex_news()
+
     try:
         closed = await _manage_sim_positions()
         if closed:
@@ -370,7 +430,7 @@ async def _run_autotrade_sim():
         pairs_data = await _fetch_multi_snapshot()
         if pairs_data.get("_fetch_errors"):
             entry["fetch_errors"] = pairs_data["_fetch_errors"]
-        scan = await _ask_gemini_scan(pairs_data)
+        scan = await _ask_gemini_scan(pairs_data, entry.get("news_check", "not checked this run"))
         entry["scanned"] = scan.get("scanned", {})
 
         action = scan.get("action", "hold")
@@ -446,6 +506,9 @@ Use the 1h timeframe to judge overall bias/direction, and the 15min timeframe to
 Give each pair a confidence score 0-100 for a trade opportunity RIGHT NOW (0 = no setup, 100 = extremely clear).
 
 Trader's risk management preferences (respect these strictly): {risk_notes}
+
+Today's news context (factor this in — avoid new trades right before/during major high-impact
+releases unless the setup is exceptionally clear): {news_context}
 
 Respond with ONLY raw JSON (no markdown, no code fences), in exactly this shape:
 {{
@@ -541,13 +604,14 @@ async def _fetch_multi_snapshot():
     return pairs_data
 
 
-async def _ask_gemini_scan(pairs_data: dict) -> dict:
+async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
     if not GEMINI_API_KEY:
         raise HTTPException(500, "GEMINI_API_KEY is not set on the server")
 
     prompt = SCAN_PROMPT.format(
         risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
         min_confidence=MIN_CONFIDENCE,
+        news_context=news_context,
         pairs_json=json.dumps(pairs_data),
     )
 
@@ -674,6 +738,12 @@ def _slim_response(entry: dict):
 
 async def _run_autotrade():
     entry = {"time": datetime.now(timezone.utc).isoformat()}
+    entry["market"] = _market_status()  # logged only — not enforced yet, per Icon's instruction
+
+    run_number_today = _bump_daily_run_count()
+    if run_number_today <= 3:
+        entry["news_check"] = await _fetch_forex_news()
+
     try:
         account_id, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
 
@@ -687,7 +757,7 @@ async def _run_autotrade():
         pairs_data = await _fetch_multi_snapshot()
         if pairs_data.get("_fetch_errors"):
             entry["fetch_errors"] = pairs_data["_fetch_errors"]
-        scan = await _ask_gemini_scan(pairs_data)
+        scan = await _ask_gemini_scan(pairs_data, entry.get("news_check", "not checked this run"))
 
         entry["scanned"] = scan.get("scanned", {})
         action = scan.get("action", "hold")
