@@ -276,6 +276,7 @@ async def sim_trade(payload: dict = Body(...)):
         "open_time": datetime.now(timezone.utc).isoformat(),
     }
     sim_account["positions"].append(pos)
+    await _github_save_state()
     return pos
 
 
@@ -288,6 +289,7 @@ async def sim_close(position_id: str):
     pnl = _sim_pnl(pos, price)
     sim_account["balance"] += pnl
     sim_account["positions"].remove(pos)
+    await _github_save_state()
     return {"closed": True, "pnl": round(pnl, 2)}
 
 
@@ -408,6 +410,14 @@ async def _fetch_forex_news():
         return f"(news fetch failed: {str(e)})"
 
 
+def _confidence_volume(base_volume: float, confidence: float) -> float:
+    """Scale lot size with how confident the AI is — a bare-minimum-confidence
+    setup gets the base size, a maximum-confidence one gets up to 3x that."""
+    span = max(100 - MIN_CONFIDENCE, 1)
+    scale = 1 + 2 * max(0, min(confidence - MIN_CONFIDENCE, span)) / span  # 1x to 3x
+    return round(base_volume * scale, 2)
+
+
 async def _run_autotrade_sim():
     entry = {"time": datetime.now(timezone.utc).isoformat()}
     entry["market"] = _market_status()  # logged only — not enforced yet, per Icon's instruction
@@ -444,7 +454,7 @@ async def _run_autotrade_sim():
             return
 
         pos = await sim_trade({
-            "symbol": best_symbol, "side": action, "volume": settings["volume"],
+            "symbol": best_symbol, "side": action, "volume": _confidence_volume(settings["volume"], confidence),
             "sl": scan.get("stop_loss"), "tp": scan.get("take_profit"),
         })
         entry.update({"status": "trade_placed", "decision": scan, "result": pos})
@@ -771,7 +781,7 @@ async def _run_autotrade():
             return
 
         result = await _place_trade(
-            conn, best_symbol, action, settings["volume"],
+            conn, best_symbol, action, _confidence_volume(settings["volume"], confidence),
             sl=scan.get("stop_loss"), tp=scan.get("take_profit"),
         )
         entry.update({"status": "trade_placed", "decision": scan, "result": str(result)})
@@ -826,7 +836,7 @@ async def _github_save_state():
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return
     _, sha = await _github_get_state()
-    payload = {"settings": settings, "chat_history": chat_history[-40:]}
+    payload = {"settings": settings, "chat_history": chat_history[-40:], "sim_account": sim_account}
     content_b64 = base64.b64encode(json.dumps(payload, indent=2).encode()).decode()
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STATE_FILE_PATH}"
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
@@ -846,6 +856,10 @@ async def _load_state_on_startup():
     if state:
         settings.update(state.get("settings", {}))
         chat_history.extend(state.get("chat_history", []))
+        saved_sim = state.get("sim_account")
+        if saved_sim:
+            sim_account["balance"] = saved_sim.get("balance", sim_account["balance"])
+            sim_account["positions"] = saved_sim.get("positions", [])
 
 
 @app.get("/api/chat/history")
