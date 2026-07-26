@@ -131,12 +131,53 @@ async function refreshAccount() {
   `;
 }
 
+let activePriceLines = [];
+
+function clearPositionLines() {
+  if (!candleSeries) return;
+  activePriceLines.forEach((line) => candleSeries.removePriceLine(line));
+  activePriceLines = [];
+}
+
+function drawPositionLines(positions) {
+  if (!candleSeries) return;
+  clearPositionLines();
+  const chartSymbol = (document.getElementById("chart-symbol").value || "").toUpperCase().replace("/", "");
+
+  positions.forEach((p) => {
+    if (p.symbol !== chartSymbol) return; // only draw lines for the symbol currently on screen
+    const entry = p.entry_price ?? p.openPrice;
+    const sl = p.sl ?? p.stopLoss;
+    const tp = p.tp ?? p.takeProfit;
+
+    if (entry) {
+      activePriceLines.push(candleSeries.createPriceLine({
+        price: entry, color: "#2f6dff", lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: "Entry",
+      }));
+    }
+    if (sl) {
+      activePriceLines.push(candleSeries.createPriceLine({
+        price: sl, color: "#ef4655", lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: "SL",
+      }));
+    }
+    if (tp) {
+      activePriceLines.push(candleSeries.createPriceLine({
+        price: tp, color: "#1fae6b", lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: "TP",
+      }));
+    }
+  });
+}
+
 async function refreshPositions() {
   const url = isSim() ? `${API_BASE}/api/sim/positions` : `${API_BASE}/api/positions/${accountId}`;
   const res = await fetch(url);
   if (res.status === 404) { logout("Session expired — please log in again."); return; }
   if (!res.ok) return;
   const positions = await res.json();
+  drawPositionLines(positions);
   const el = document.getElementById("positions");
   el.innerHTML = "";
 
@@ -265,6 +306,36 @@ function initChartIfNeeded() {
   });
 }
 
+function computeBoundaryMarkers(formatted, interval) {
+  // The free chart library doesn't support true vertical divider lines,
+  // so this places a small labeled marker at each day/week/month boundary instead.
+  const markers = [];
+  let lastKey = null;
+  formatted.forEach((c) => {
+    const d = new Date(c.time * 1000);
+    let key, text;
+    if (interval === "4h") {
+      const day = d.getUTCDay();
+      const diffToMonday = (day === 0 ? -6 : 1) - day;
+      const monday = new Date(d);
+      monday.setUTCDate(d.getUTCDate() + diffToMonday);
+      key = monday.toISOString().slice(0, 10);
+      text = "Week";
+    } else if (interval === "1day") {
+      key = `${d.getUTCFullYear()}-${d.getUTCMonth()}`;
+      text = d.toLocaleDateString(undefined, { month: "short" });
+    } else {
+      key = d.toISOString().slice(0, 10);
+      text = d.toLocaleDateString(undefined, { weekday: "short" });
+    }
+    if (key !== lastKey) {
+      markers.push({ time: c.time, position: "aboveBar", color: "#7a8494", shape: "circle", text });
+      lastKey = key;
+    }
+  });
+  return markers;
+}
+
 function toChartTime(datetimeStr) {
   // Twelve Data returns "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD" for daily
   return Math.floor(new Date(datetimeStr.replace(" ", "T") + "Z").getTime() / 1000);
@@ -306,6 +377,7 @@ async function loadChartHistory() {
       close: c.close,
     }));
     candleSeries.setData(formatted);
+    candleSeries.setMarkers(computeBoundaryMarkers(formatted, currentInterval));
     chart.timeScale().fitContent();
   } catch (err) {
     statusEl.style.color = "#ef4655";
