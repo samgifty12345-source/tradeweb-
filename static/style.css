@@ -74,6 +74,29 @@ button {
 }
 .primary-btn:hover { background: #1e5ae8; }
 
+.divider {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  margin: 16px 0;
+}
+.divider::before, .divider::after {
+  content: "";
+  flex: 1;
+  border-bottom: 1px solid var(--border);
+}
+.divider span { padding: 0 10px; }
+
+.secondary-btn {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.secondary-btn:hover { background: #1a2029; border-color: var(--blue); }
+
 /* Dashboard */
 .topbar {
   display: flex;
