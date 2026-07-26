@@ -35,6 +35,16 @@ async function connectAccount() {
   }
 }
 
+function useDemoAccount() {
+  accountId = "SIM";
+  localStorage.setItem("accountId", "SIM");
+  showDashboard();
+}
+
+function isSim() {
+  return accountId === "SIM";
+}
+
 function logout(reason) {
   // pure local action — clears session and resets the UI even if
   // network calls elsewhere on the page are frozen/hanging
@@ -107,18 +117,20 @@ async function refreshAutotradeLog() {
 }
 
 async function refreshAccount() {
-  const res = await fetch(`${API_BASE}/api/account/${accountId}`);
+  const url = isSim() ? `${API_BASE}/api/sim/account` : `${API_BASE}/api/account/${accountId}`;
+  const res = await fetch(url);
   if (res.status === 404) { logout("Session expired — please log in again."); return; }
   if (!res.ok) return;
   const info = await res.json();
   document.getElementById("account-info").innerHTML = `
-    <div><span class="stat-label">Balance</span>${info.balance} ${info.currency}</div>
+    <div><span class="stat-label">Balance${isSim() ? " (demo)" : ""}</span>${info.balance} ${info.currency}</div>
     <div><span class="stat-label">Equity</span>${info.equity} ${info.currency}</div>
   `;
 }
 
 async function refreshPositions() {
-  const res = await fetch(`${API_BASE}/api/positions/${accountId}`);
+  const url = isSim() ? `${API_BASE}/api/sim/positions` : `${API_BASE}/api/positions/${accountId}`;
+  const res = await fetch(url);
   if (res.status === 404) { logout("Session expired — please log in again."); return; }
   if (!res.ok) return;
   const positions = await res.json();
@@ -157,7 +169,8 @@ async function trade(side) {
 
   document.getElementById("trade-status").innerText = "Placing order...";
   try {
-    const res = await fetch(`${API_BASE}/api/trade/${accountId}`, {
+    const url = isSim() ? `${API_BASE}/api/sim/trade` : `${API_BASE}/api/trade/${accountId}`;
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ symbol, side, volume, sl, tp }),
@@ -166,14 +179,17 @@ async function trade(side) {
     if (!res.ok) throw new Error(data.detail || "Order failed");
     document.getElementById("trade-status").innerText = "Order placed.";
     refreshPositions();
+    refreshAccount();
   } catch (err) {
     document.getElementById("trade-status").innerText = "Failed: " + err.message;
   }
 }
 
 async function closePosition(positionId) {
-  await fetch(`${API_BASE}/api/close/${accountId}/${positionId}`, { method: "POST" });
+  const url = isSim() ? `${API_BASE}/api/sim/close/${positionId}` : `${API_BASE}/api/close/${accountId}/${positionId}`;
+  await fetch(url, { method: "POST" });
   refreshPositions();
+  refreshAccount();
 }
 
 // ---------- Chat with AI ----------
