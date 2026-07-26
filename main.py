@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Dict
 
 import httpx
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Body, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -354,48 +354,58 @@ async def _manage_sim_positions():
     return closed
 
 
+async def _run_autotrade_sim():
+    entry = {"time": datetime.now(timezone.utc).isoformat()}
+    try:
+        closed = await _manage_sim_positions()
+        if closed:
+            entry["closed_positions"] = closed
+
+        if len(sim_account["positions"]) >= MAX_OPEN_POSITIONS:
+            entry.update({"status": "skipped", "reason": f"{len(sim_account['positions'])} open sim position(s)"})
+            autotrade_log.append(entry)
+            del autotrade_log[:-50]
+            return
+
+        pairs_data = await _fetch_multi_snapshot()
+        if pairs_data.get("_fetch_errors"):
+            entry["fetch_errors"] = pairs_data["_fetch_errors"]
+        scan = await _ask_gemini_scan(pairs_data)
+        entry["scanned"] = scan.get("scanned", {})
+
+        action = scan.get("action", "hold")
+        best_symbol = scan.get("best_symbol")
+        confidence = scan.get("confidence", 0)
+
+        if action not in ("buy", "sell") or not best_symbol or confidence < MIN_CONFIDENCE:
+            entry.update({"status": "hold", "decision": scan})
+            autotrade_log.append(entry)
+            del autotrade_log[:-50]
+            return
+
+        pos = await sim_trade({
+            "symbol": best_symbol, "side": action, "volume": settings["volume"],
+            "sl": scan.get("stop_loss"), "tp": scan.get("take_profit"),
+        })
+        entry.update({"status": "trade_placed", "decision": scan, "result": pos})
+        autotrade_log.append(entry)
+        del autotrade_log[:-50]
+    except Exception as e:
+        entry.update({"status": "error", "reason": str(e)})
+        autotrade_log.append(entry)
+        del autotrade_log[:-50]
+
+
 @app.get("/api/autotrade-sim")
-async def autotrade_sim(secret: str = Query(...)):
+async def autotrade_sim(secret: str = Query(...), background_tasks: BackgroundTasks = None):
     """Same AI scan as the real autotrade loop, but trades the built-in demo
-    account instead of a real MetaApi account. Safe to run on its own cron
-    while your real account is blocked on billing."""
+    account. Returns immediately — the actual scan (which can take a couple
+    minutes due to free-tier rate limits) runs in the background and the
+    result appears in the dashboard's AI Auto-Trade Log a bit later."""
     if not AUTOTRADE_SECRET or secret != AUTOTRADE_SECRET:
         raise HTTPException(403, "Invalid secret")
-
-    entry = {"time": datetime.now(timezone.utc).isoformat()}
-
-    closed = await _manage_sim_positions()
-    if closed:
-        entry["closed_positions"] = closed
-
-    if len(sim_account["positions"]) >= MAX_OPEN_POSITIONS:
-        entry.update({"status": "skipped", "reason": f"{len(sim_account['positions'])} open sim position(s)"})
-        autotrade_log.append(entry)
-        del autotrade_log[:-50]
-        return _slim_response(entry)
-
-    pairs_data = await _fetch_multi_snapshot()
-    scan = await _ask_gemini_scan(pairs_data)
-    entry["scanned"] = scan.get("scanned", {})
-
-    action = scan.get("action", "hold")
-    best_symbol = scan.get("best_symbol")
-    confidence = scan.get("confidence", 0)
-
-    if action not in ("buy", "sell") or not best_symbol or confidence < MIN_CONFIDENCE:
-        entry.update({"status": "hold", "decision": scan})
-        autotrade_log.append(entry)
-        del autotrade_log[:-50]
-        return _slim_response(entry)
-
-    pos = await sim_trade({
-        "symbol": best_symbol, "side": action, "volume": settings["volume"],
-        "sl": scan.get("stop_loss"), "tp": scan.get("take_profit"),
-    })
-    entry.update({"status": "trade_placed", "decision": scan, "result": pos})
-    autotrade_log.append(entry)
-    del autotrade_log[:-50]
-    return _slim_response(entry)
+    background_tasks.add_task(_run_autotrade_sim)
+    return {"status": "started", "note": "Scan running in background — check the AI Auto-Trade Log on your dashboard in ~2-3 min"}
 
 
 # ---------------- Autotrade (AI-driven, triggered by a free external cron) ----------------
@@ -489,19 +499,45 @@ def _with_indicators(candles: list):
     }
 
 
+_candle_cache: Dict[str, tuple] = {}  # "symbol:interval" -> (timestamp, candles)
+CANDLE_CACHE_TTL = {"15min": 300, "30min": 600, "1h": 1200, "4h": 3600}
+
+
+async def _fetch_candles_cached(symbol: str, interval: str, outputsize: int = 30):
+    key = f"{symbol}:{interval}:{outputsize}"
+    now = datetime.now(timezone.utc).timestamp()
+    cached = _candle_cache.get(key)
+    ttl = CANDLE_CACHE_TTL.get(interval, 300)
+    if cached and now - cached[0] < ttl:
+        return cached[1]
+    candles = await _fetch_candles(symbol, interval, outputsize)
+    _candle_cache[key] = (now, candles)
+    return candles
+
+
 async def _fetch_multi_snapshot():
-    """Fetch 15min + 1h candles for every pair in the watchlist. Throttled slightly
-    to respect Twelve Data's free-tier rate limit (8 requests/min)."""
+    """Fetch 15min/30min/1h/4h candles for every pair in the watchlist.
+    Cached per timeframe (longer timeframes cached longer, since they barely
+    change minute to minute) and throttled to respect Twelve Data's free-tier
+    limit of 8 requests/min — real API calls are spaced 8s apart; cache hits
+    don't count against that at all."""
     pairs_data = {}
+    errors = []
     for symbol in WATCHLIST:
         pairs_data[symbol] = {}
         for tf in SCAN_TIMEFRAMES:
+            key = f"{symbol}:{tf}:30"
+            was_cached = key in _candle_cache and (datetime.now(timezone.utc).timestamp() - _candle_cache[key][0]) < CANDLE_CACHE_TTL.get(tf, 300)
             try:
-                candles = await _fetch_candles(symbol, interval=tf, outputsize=30)
+                candles = await _fetch_candles_cached(symbol, tf, outputsize=30)
                 pairs_data[symbol][tf] = _with_indicators(candles) if candles else {"candles": [], "sma20": None, "sma50": None, "rsi14": None}
-            except Exception:
+            except Exception as e:
+                errors.append(f"{symbol} {tf}: {str(e)}")
                 pairs_data[symbol][tf] = {"candles": [], "sma20": None, "sma50": None, "rsi14": None}
-            await asyncio.sleep(0.8)  # stay under 8 req/min
+            if not was_cached:
+                await asyncio.sleep(8)  # stay under 8 req/min for real calls only
+    if errors:
+        pairs_data["_fetch_errors"] = errors
     return pairs_data
 
 
@@ -636,17 +672,7 @@ def _slim_response(entry: dict):
     }
 
 
-@app.get("/api/autotrade")
-async def autotrade(secret: str = Query(...)):
-    """Hit this URL from a free external cron every 15-30 min. Scans the whole
-    watchlist across 15min + 1h timeframes and only trades the single highest-
-    confidence setup, if any clears MIN_CONFIDENCE."""
-    if not AUTOTRADE_SECRET or secret != AUTOTRADE_SECRET:
-        raise HTTPException(403, "Invalid secret")
-
-    if not all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
-        raise HTTPException(500, "MT_LOGIN, MT_PASSWORD, MT_SERVER env vars must be set for autotrade")
-
+async def _run_autotrade():
     entry = {"time": datetime.now(timezone.utc).isoformat()}
     try:
         account_id, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
@@ -656,9 +682,11 @@ async def autotrade(secret: str = Query(...)):
             entry.update({"status": "skipped", "reason": f"{len(positions)} open position(s), max is {MAX_OPEN_POSITIONS}"})
             autotrade_log.append(entry)
             del autotrade_log[:-50]
-            return _slim_response(entry)
+            return
 
         pairs_data = await _fetch_multi_snapshot()
+        if pairs_data.get("_fetch_errors"):
+            entry["fetch_errors"] = pairs_data["_fetch_errors"]
         scan = await _ask_gemini_scan(pairs_data)
 
         entry["scanned"] = scan.get("scanned", {})
@@ -670,7 +698,7 @@ async def autotrade(secret: str = Query(...)):
             entry.update({"status": "hold", "decision": scan})
             autotrade_log.append(entry)
             del autotrade_log[:-50]
-            return _slim_response(entry)
+            return
 
         result = await _place_trade(
             conn, best_symbol, action, settings["volume"],
@@ -679,18 +707,24 @@ async def autotrade(secret: str = Query(...)):
         entry.update({"status": "trade_placed", "decision": scan, "result": str(result)})
         autotrade_log.append(entry)
         del autotrade_log[:-50]
-        return _slim_response(entry)
 
-    except HTTPException as e:
-        entry.update({"status": "error", "reason": str(e.detail)})
-        autotrade_log.append(entry)
-        del autotrade_log[:-50]
-        raise
     except Exception as e:
         entry.update({"status": "error", "reason": str(e)})
         autotrade_log.append(entry)
         del autotrade_log[:-50]
-        raise HTTPException(502, f"Autotrade failed: {str(e)}")
+
+
+@app.get("/api/autotrade")
+async def autotrade(secret: str = Query(...), background_tasks: BackgroundTasks = None):
+    """Hit this URL from a free external cron every hour. Returns immediately;
+    the actual scan (which can take a couple minutes due to free-tier rate
+    limits) runs in the background — check the AI Auto-Trade Log for results."""
+    if not AUTOTRADE_SECRET or secret != AUTOTRADE_SECRET:
+        raise HTTPException(403, "Invalid secret")
+    if not all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
+        raise HTTPException(500, "MT_LOGIN, MT_PASSWORD, MT_SERVER env vars must be set for autotrade")
+    background_tasks.add_task(_run_autotrade)
+    return {"status": "started", "note": "Scan running in background — check the AI Auto-Trade Log on your dashboard in ~2-3 min"}
 
 
 @app.get("/api/autotrade/log")
