@@ -757,12 +757,16 @@ async def get_settings():
 CHAT_SYSTEM_PROMPT = """You are the trading assistant embedded in Icon's trading dashboard.
 You can chat normally about markets, strategy, and risk management.
 
-You also control the live auto-trader's settings, AND you can place a trade immediately
-if the user explicitly asks you to (e.g. "buy gold now", "place a sell on EURUSD 0.01 lots").
-Only trigger a trade on a clear, explicit instruction — never on your own initiative during
-normal conversation, and never just because you think it's a good setup.
+The auto-trader scans this ENTIRE watchlist every cycle, not just one pair: {watchlist}
+It checks these timeframes on each pair: {scan_timeframes}
+A trade only fires if a pair scores {min_confidence}+ confidence out of 100.
+Max loss per position: ${max_loss}, profit target: ${profit_target}.
 
-Current settings: symbol={symbol}, timeframe={interval}, lot size={volume}, risk notes="{risk_notes}"
+You also directly control: symbol={symbol}, timeframe={interval}, lot size={volume}, risk notes="{risk_notes}"
+(these are separate manual-trade defaults, distinct from the full watchlist scan above)
+
+You can place a trade immediately if the user explicitly asks (e.g. "buy gold now").
+Only trigger a trade on a clear, explicit instruction — never on your own initiative.
 
 LIVE DATA (use this — do not guess or use outdated training knowledge):
 {live_data}
@@ -814,7 +818,12 @@ async def _live_data_snapshot():
 
     if autotrade_log:
         last_entry = autotrade_log[-1]
-        parts.append(f"Last auto-trade check: {last_entry.get('status')} — {last_entry.get('reason') or (last_entry.get('decision') or {}).get('reason', '')}")
+        scanned = last_entry.get("scanned") or (last_entry.get("decision") or {}).get("scanned")
+        if scanned:
+            per_pair = "; ".join(f"{sym}: {info.get('action')} ({info.get('confidence')}% conf) — {info.get('note','')}" for sym, info in scanned.items())
+            parts.append(f"Last full scan ({last_entry.get('time')}): {per_pair}")
+        else:
+            parts.append(f"Last auto-trade check: {last_entry.get('status')} — {last_entry.get('reason') or (last_entry.get('decision') or {}).get('reason', '')}")
 
     return "\n".join(parts)
 
@@ -836,6 +845,11 @@ async def chat(payload: dict = Body(...)):
         volume=settings["volume"],
         risk_notes=settings["risk_notes"] or "none set",
         live_data=live_data,
+        watchlist=", ".join(WATCHLIST),
+        scan_timeframes=", ".join(SCAN_TIMEFRAMES),
+        min_confidence=MIN_CONFIDENCE,
+        max_loss=MAX_LOSS_USD,
+        profit_target=PROFIT_TARGET_USD,
     )
 
     contents = [{"role": h["role"], "parts": [{"text": h["text"]}]} for h in chat_history[-20:]]
@@ -886,27 +900,42 @@ async def chat(payload: dict = Body(...)):
     trade_action = parsed.get("trade_action")
 
     if trade_action and trade_action.get("side") in ("buy", "sell"):
-        if not all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
-            reply += "\n\n(Couldn't place it — no MT5 account configured on the server.)"
-        else:
+        trade_symbol = trade_action.get("symbol") or settings["symbol"]
+        trade_volume = trade_action.get("volume") or settings["volume"]
+
+        real_account_available = all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
+        placed_on = None
+
+        if real_account_available:
             try:
                 _, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
-                trade_symbol = trade_action.get("symbol") or settings["symbol"]
-                trade_volume = trade_action.get("volume") or settings["volume"]
                 result = await _place_trade(
                     conn, trade_symbol, trade_action["side"], trade_volume,
                     sl=trade_action.get("stop_loss"), tp=trade_action.get("take_profit"),
                 )
-                reply += f"\n\n✅ Placed {trade_action['side'].upper()} {trade_volume} lots on {trade_symbol}."
-                autotrade_log.append({
-                    "time": datetime.now(timezone.utc).isoformat(),
-                    "status": "trade_placed",
-                    "decision": {"action": trade_action["side"], "reason": "Manual command via chat"},
-                    "result": str(result),
-                })
-                del autotrade_log[:-50]
+                placed_on = "real"
             except Exception as e:
-                reply += f"\n\n❌ Trade failed: {str(e)}"
+                result = None
+                real_error = str(e)
+
+        if placed_on != "real":
+            # fall back to the built-in demo account so trade commands still work
+            # while the real MetaApi account is blocked/unavailable
+            result = await sim_trade({
+                "symbol": trade_symbol, "side": trade_action["side"], "volume": trade_volume,
+                "sl": trade_action.get("stop_loss"), "tp": trade_action.get("take_profit"),
+            })
+            placed_on = "demo"
+
+        label = "on your REAL account" if placed_on == "real" else "on your DEMO account (real account unavailable right now)"
+        reply += f"\n\n✅ Placed {trade_action['side'].upper()} {trade_volume} lots on {trade_symbol} {label}."
+        autotrade_log.append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "status": "trade_placed",
+            "decision": {"action": trade_action["side"], "reason": f"Manual command via chat ({placed_on})"},
+            "result": str(result),
+        })
+        del autotrade_log[:-50]
 
     chat_history.append({"role": "user", "text": message})
     chat_history.append({"role": "model", "text": reply})
