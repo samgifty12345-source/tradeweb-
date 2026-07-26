@@ -1,6 +1,9 @@
 import os
 import uuid
 import json
+import asyncio
+import base64
+from datetime import datetime, timezone
 from typing import Dict
 
 import httpx
@@ -197,6 +200,204 @@ async def get_chart(symbol: str, interval: str = "5min", outputsize: int = 100):
     return {"symbol": symbol.upper(), "candles": candles}
 
 
+# ---------------- Built-in simulated demo account (no MetaApi needed) ----------------
+
+sim_account = {"balance": 5000.0, "positions": []}  # positions: list of dicts
+_price_cache: Dict[str, tuple] = {}  # symbol -> (timestamp, price)
+PRICE_CACHE_TTL = 15  # seconds
+
+MAX_LOSS_USD = float(os.getenv("MAX_LOSS_USD", "300"))
+PROFIT_TARGET_USD = float(os.getenv("PROFIT_TARGET_USD", "300"))
+
+# Rough per-instrument contract sizing — approximate, NOT exact broker specs.
+# This is for realistic-feeling testing, not precise accounting.
+CONTRACT_SIZE = {"XAUUSD": 100, "BTCUSD": 1, "ETHUSD": 1}
+DEFAULT_CONTRACT_SIZE = 100000  # standard forex lot
+
+
+async def _get_price(symbol: str) -> float:
+    now = datetime.now(timezone.utc).timestamp()
+    cached = _price_cache.get(symbol)
+    if cached and now - cached[0] < PRICE_CACHE_TTL:
+        return cached[1]
+    candles = await _fetch_candles(symbol, interval="1min", outputsize=1)
+    price = candles[-1]["close"] if candles else (cached[1] if cached else 0.0)
+    _price_cache[symbol] = (now, price)
+    return price
+
+
+def _sim_pnl(position: dict, current_price: float) -> float:
+    direction = 1 if position["side"] == "buy" else -1
+    contract = CONTRACT_SIZE.get(position["symbol"], DEFAULT_CONTRACT_SIZE)
+    return (current_price - position["entry_price"]) * position["volume"] * contract * direction / (
+        1 if position["symbol"] in CONTRACT_SIZE else 10000  # keep forex P/L in a sane dollar range
+    )
+
+
+@app.get("/api/sim/account")
+async def sim_account_info():
+    total_pnl = 0.0
+    for p in sim_account["positions"]:
+        price = await _get_price(p["symbol"])
+        total_pnl += _sim_pnl(p, price)
+    return {"balance": round(sim_account["balance"], 2), "equity": round(sim_account["balance"] + total_pnl, 2), "currency": "USD"}
+
+
+@app.get("/api/sim/positions")
+async def sim_positions():
+    result = []
+    for p in sim_account["positions"]:
+        price = await _get_price(p["symbol"])
+        pnl = _sim_pnl(p, price)
+        result.append({**p, "profit": round(pnl, 2), "type": p["side"]})
+    return result
+
+
+@app.post("/api/sim/trade")
+async def sim_trade(payload: dict = Body(...)):
+    symbol = (payload.get("symbol") or "").upper()
+    side = payload.get("side")
+    volume = float(payload.get("volume") or 0.01)
+    sl = payload.get("sl")
+    tp = payload.get("tp")
+
+    if not symbol or side not in ("buy", "sell"):
+        raise HTTPException(400, "symbol and a valid side (buy/sell) are required")
+
+    price = await _get_price(symbol)
+    pos = {
+        "id": uuid.uuid4().hex[:10],
+        "symbol": symbol,
+        "side": side,
+        "volume": volume,
+        "entry_price": price,
+        "sl": float(sl) if sl else None,
+        "tp": float(tp) if tp else None,
+        "open_time": datetime.now(timezone.utc).isoformat(),
+    }
+    sim_account["positions"].append(pos)
+    return pos
+
+
+@app.post("/api/sim/close/{position_id}")
+async def sim_close(position_id: str):
+    pos = next((p for p in sim_account["positions"] if p["id"] == position_id), None)
+    if not pos:
+        raise HTTPException(404, "Position not found")
+    price = await _get_price(pos["symbol"])
+    pnl = _sim_pnl(pos, price)
+    sim_account["balance"] += pnl
+    sim_account["positions"].remove(pos)
+    return {"closed": True, "pnl": round(pnl, 2)}
+
+
+MANAGE_PROMPT = """You are managing an open {side} position on {symbol}, opened at {entry_price}.
+Current floating P/L: ${pnl:.2f} (max loss allowed: -${max_loss}, profit target: ${profit_target}).
+
+Recent {interval} candles (oldest first): {candles_json}
+
+Decide if this position should be closed now because momentum is fading/reversing against it,
+even though it hasn't hit the hard $ targets yet. Be conservative — only recommend closing early
+on a genuine reversal signal, not minor noise.
+
+Respond with ONLY raw JSON: {{"close": true|false, "reason": "one short sentence"}}
+"""
+
+
+async def _ask_manage_gemini(pos: dict, candles: list, pnl: float) -> dict:
+    prompt = MANAGE_PROMPT.format(
+        side=pos["side"], symbol=pos["symbol"], entry_price=pos["entry_price"], pnl=pnl,
+        max_loss=MAX_LOSS_USD, profit_target=PROFIT_TARGET_USD,
+        interval=settings["interval"], candles_json=json.dumps(candles),
+    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, headers=headers, json=body)
+    if r.status_code != 200:
+        return {"close": False, "reason": "management check failed"}
+    try:
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+        return json.loads(text.strip())
+    except Exception:
+        return {"close": False, "reason": "couldn't parse management response"}
+
+
+async def _manage_sim_positions():
+    """Runs every autotrade-sim cycle before scanning for new trades. Closes
+    positions that hit the $ stop/target, or that the AI judges to be losing
+    momentum even before hitting those hard limits."""
+    closed = []
+    for pos in list(sim_account["positions"]):
+        price = await _get_price(pos["symbol"])
+        pnl = _sim_pnl(pos, price)
+
+        if pnl <= -MAX_LOSS_USD or pnl >= PROFIT_TARGET_USD:
+            result = await sim_close(pos["id"])
+            closed.append({"symbol": pos["symbol"], "reason": f"Hit {'stop loss' if pnl < 0 else 'profit target'} (${pnl:.2f})", "pnl": result["pnl"]})
+            continue
+
+        try:
+            candles = await _fetch_candles(pos["symbol"], interval=settings["interval"], outputsize=20)
+            decision = await _ask_manage_gemini(pos, candles, pnl)
+            if decision.get("close"):
+                result = await sim_close(pos["id"])
+                closed.append({"symbol": pos["symbol"], "reason": decision.get("reason", "AI judged momentum was fading"), "pnl": result["pnl"]})
+        except Exception:
+            pass  # leave position open if the check itself fails
+
+    return closed
+
+
+@app.get("/api/autotrade-sim")
+async def autotrade_sim(secret: str = Query(...)):
+    """Same AI scan as the real autotrade loop, but trades the built-in demo
+    account instead of a real MetaApi account. Safe to run on its own cron
+    while your real account is blocked on billing."""
+    if not AUTOTRADE_SECRET or secret != AUTOTRADE_SECRET:
+        raise HTTPException(403, "Invalid secret")
+
+    entry = {"time": datetime.now(timezone.utc).isoformat()}
+
+    closed = await _manage_sim_positions()
+    if closed:
+        entry["closed_positions"] = closed
+
+    if len(sim_account["positions"]) >= MAX_OPEN_POSITIONS:
+        entry.update({"status": "skipped", "reason": f"{len(sim_account['positions'])} open sim position(s)"})
+        autotrade_log.append(entry)
+        del autotrade_log[:-50]
+        return _slim_response(entry)
+
+    pairs_data = await _fetch_multi_snapshot()
+    scan = await _ask_gemini_scan(pairs_data)
+    entry["scanned"] = scan.get("scanned", {})
+
+    action = scan.get("action", "hold")
+    best_symbol = scan.get("best_symbol")
+    confidence = scan.get("confidence", 0)
+
+    if action not in ("buy", "sell") or not best_symbol or confidence < MIN_CONFIDENCE:
+        entry.update({"status": "hold", "decision": scan})
+        autotrade_log.append(entry)
+        del autotrade_log[:-50]
+        return _slim_response(entry)
+
+    pos = await sim_trade({
+        "symbol": best_symbol, "side": action, "volume": settings["volume"],
+        "sl": scan.get("stop_loss"), "tp": scan.get("take_profit"),
+    })
+    entry.update({"status": "trade_placed", "decision": scan, "result": pos})
+    autotrade_log.append(entry)
+    del autotrade_log[:-50]
+    return _slim_response(entry)
+
+
 # ---------------- Autotrade (AI-driven, triggered by a free external cron) ----------------
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -217,7 +418,130 @@ settings = {
     "risk_notes": "",  # free-text risk preferences the AI should respect
 }
 
-GEMINI_MODEL = "gemini-2.5-flash"
+WATCHLIST = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD", "ETHUSD"]
+SCAN_TIMEFRAMES = ["15min", "30min", "1h", "4h"]
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # override via env var to try e.g. gemini-3-flash-preview
+
+SCAN_PROMPT = """You are a disciplined ICT / Smart Money Concepts trader scanning multiple pairs
+to find the single best trade opportunity right now.
+
+For each pair below you're given, per timeframe: candles (oldest first, as {{time, open, high, low, close}}),
+plus sma20, sma50 (simple moving averages) and rsi14 (14-period RSI) already calculated for you — use these
+alongside your own reading of the candles rather than re-deriving them.
+
+For EACH pair, analyze for: liquidity sweeps, break of structure (BOS), change of character (CHoCH),
+fair value gaps (FVG), order blocks, and notable candle patterns (doji, engulfing, pin bars).
+Use the 1h timeframe to judge overall bias/direction, and the 15min timeframe to judge entry timing.
+Give each pair a confidence score 0-100 for a trade opportunity RIGHT NOW (0 = no setup, 100 = extremely clear).
+
+Trader's risk management preferences (respect these strictly): {risk_notes}
+
+Respond with ONLY raw JSON (no markdown, no code fences), in exactly this shape:
+{{
+  "scanned": {{"XAUUSD": {{"action": "buy"|"sell"|"hold", "confidence": number, "note": "one short phrase"}}, ... one entry per pair ...}},
+  "best_symbol": string | null,
+  "action": "buy" | "sell" | "hold",
+  "confidence": number,
+  "stop_loss": number | null,
+  "take_profit": number | null,
+  "reason": "one short sentence explaining the pick"
+}}
+
+best_symbol/action should be the single highest-confidence non-hold setup across ALL pairs, only if its
+confidence is at least {min_confidence}. Otherwise action must be "hold" and best_symbol null.
+stop_loss/take_profit must be realistic absolute prices for best_symbol, consistent with its recent price levels.
+
+Data:
+{pairs_json}
+"""
+
+
+def _sma(closes: list, period: int):
+    if len(closes) < period:
+        return None
+    return round(sum(closes[-period:]) / period, 5)
+
+
+def _rsi(closes: list, period: int = 14):
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+
+def _with_indicators(candles: list):
+    closes = [c["close"] for c in candles]
+    return {
+        "candles": candles,
+        "sma20": _sma(closes, 20),
+        "sma50": _sma(closes, 50),
+        "rsi14": _rsi(closes, 14),
+    }
+
+
+async def _fetch_multi_snapshot():
+    """Fetch 15min + 1h candles for every pair in the watchlist. Throttled slightly
+    to respect Twelve Data's free-tier rate limit (8 requests/min)."""
+    pairs_data = {}
+    for symbol in WATCHLIST:
+        pairs_data[symbol] = {}
+        for tf in SCAN_TIMEFRAMES:
+            try:
+                candles = await _fetch_candles(symbol, interval=tf, outputsize=30)
+                pairs_data[symbol][tf] = _with_indicators(candles) if candles else {"candles": [], "sma20": None, "sma50": None, "rsi14": None}
+            except Exception:
+                pairs_data[symbol][tf] = {"candles": [], "sma20": None, "sma50": None, "rsi14": None}
+            await asyncio.sleep(0.8)  # stay under 8 req/min
+    return pairs_data
+
+
+async def _ask_gemini_scan(pairs_data: dict) -> dict:
+    if not GEMINI_API_KEY:
+        raise HTTPException(500, "GEMINI_API_KEY is not set on the server")
+
+    prompt = SCAN_PROMPT.format(
+        risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
+        min_confidence=MIN_CONFIDENCE,
+        pairs_json=json.dumps(pairs_data),
+    )
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        r = await client.post(url, headers=headers, json=body)
+
+    if r.status_code != 200:
+        raise HTTPException(502, f"Gemini call failed: {r.text[:300]}")
+
+    data = r.json()
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise HTTPException(502, f"Unexpected Gemini response: {json.dumps(data)[:300]}")
+
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    text = text.strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise HTTPException(502, f"Gemini did not return valid JSON: {text[:300]}")
 
 STRATEGY_PROMPT = """You are a disciplined ICT / Smart Money Concepts forex and gold trader.
 You will be given the most recent {n} candles for {symbol} on the {interval} timeframe,
@@ -282,16 +606,41 @@ async def _ask_gemini(symbol: str, interval: str, candles: list) -> dict:
     return decision
 
 
-from datetime import datetime, timezone
-
 autotrade_log = []  # in-memory log of recent AI decisions, newest last
+
+
+@app.get("/api/scan-test")
+async def scan_test(secret: str = Query(...)):
+    """Test the AI's multi-pair scan WITHOUT connecting to MetaApi or placing any
+    trade — safe to use right now while your MetaApi account is blocked on billing."""
+    if not AUTOTRADE_SECRET or secret != AUTOTRADE_SECRET:
+        raise HTTPException(403, "Invalid secret")
+
+    pairs_data = await _fetch_multi_snapshot()
+    scan = await _ask_gemini_scan(pairs_data)
+    return scan
+
+
+def _slim_response(entry: dict):
+    """cron-job.org rejects large response bodies — send it just a small
+    confirmation, while the FULL detail still lives in autotrade_log for the
+    dashboard's AI Auto-Trade Log panel."""
+    decision = entry.get("decision") or {}
+    return {
+        "status": entry.get("status"),
+        "time": entry.get("time"),
+        "symbol": decision.get("best_symbol"),
+        "action": decision.get("action"),
+        "confidence": decision.get("confidence"),
+        "reason": entry.get("reason") or decision.get("reason"),
+    }
 
 
 @app.get("/api/autotrade")
 async def autotrade(secret: str = Query(...)):
-    """Hit this URL from a free external cron (e.g. cron-job.org) every 15 min.
-    Runs while you sleep — no separate server/VPS needed, since MetaApi already
-    keeps the MT5 account deployed and connected in its own cloud."""
+    """Hit this URL from a free external cron every 15-30 min. Scans the whole
+    watchlist across 15min + 1h timeframes and only trades the single highest-
+    confidence setup, if any clears MIN_CONFIDENCE."""
     if not AUTOTRADE_SECRET or secret != AUTOTRADE_SECRET:
         raise HTTPException(403, "Invalid secret")
 
@@ -307,30 +656,30 @@ async def autotrade(secret: str = Query(...)):
             entry.update({"status": "skipped", "reason": f"{len(positions)} open position(s), max is {MAX_OPEN_POSITIONS}"})
             autotrade_log.append(entry)
             del autotrade_log[:-50]
-            return entry
+            return _slim_response(entry)
 
-        symbol = settings["symbol"]
-        interval = settings["interval"]
-        volume = settings["volume"]
+        pairs_data = await _fetch_multi_snapshot()
+        scan = await _ask_gemini_scan(pairs_data)
 
-        candles = await _fetch_candles(symbol, interval=interval, outputsize=50)
-        decision = await _ask_gemini(symbol, interval, candles)
+        entry["scanned"] = scan.get("scanned", {})
+        action = scan.get("action", "hold")
+        best_symbol = scan.get("best_symbol")
+        confidence = scan.get("confidence", 0)
 
-        action = decision.get("action", "hold")
-        if action not in ("buy", "sell"):
-            entry.update({"status": "hold", "decision": decision})
+        if action not in ("buy", "sell") or not best_symbol or confidence < MIN_CONFIDENCE:
+            entry.update({"status": "hold", "decision": scan})
             autotrade_log.append(entry)
             del autotrade_log[:-50]
-            return entry
+            return _slim_response(entry)
 
         result = await _place_trade(
-            conn, symbol, action, volume,
-            sl=decision.get("stop_loss"), tp=decision.get("take_profit"),
+            conn, best_symbol, action, settings["volume"],
+            sl=scan.get("stop_loss"), tp=scan.get("take_profit"),
         )
-        entry.update({"status": "trade_placed", "decision": decision, "result": str(result)})
+        entry.update({"status": "trade_placed", "decision": scan, "result": str(result)})
         autotrade_log.append(entry)
         del autotrade_log[:-50]
-        return entry
+        return _slim_response(entry)
 
     except HTTPException as e:
         entry.update({"status": "error", "reason": str(e.detail)})
@@ -348,8 +697,6 @@ async def autotrade(secret: str = Query(...)):
 async def get_autotrade_log():
     return list(reversed(autotrade_log))
 
-
-import base64
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "")  # e.g. "yourname/tradeweb"
